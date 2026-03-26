@@ -1,0 +1,17 @@
+# Ignore build directory 
+build/
+out/
+bin/
+certs/
+
+# Ignore config directory
+*.vscode
+*.vs
+
+# Misc
+.DS_Store
+
+# Ignore config file
+CMakeSettings.json
+CMakeUserPresets.json
+
