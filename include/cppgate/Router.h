@@ -21,7 +21,7 @@
 
 namespace gtvr::router {
 
-    struct RouterParams
+    struct RouteParams
     {
         #ifdef HAVE_MEMORY_RESOURCE
             private:
@@ -32,12 +32,12 @@ namespace gtvr::router {
             public:
                 std::pmr::vector<std::pair<std::string_view, std::string_view>> params;
 
-                RouterParams(size_t bufer_size): buffer(std::make_unique<std::byte[]>(bufer_size)), pool(buffer.get(), bufer_size), params(&pool) {}
+                RouteParams(size_t bufer_size): buffer(std::make_unique<std::byte[]>(bufer_size)), pool(buffer.get(), bufer_size), params(&pool) {}
         #else
             public:
                 std::vector<std::pair<std::string_view, std::string_view>> params;
 
-                RouterPamas(size_t bufer_size) {}
+                RouteParams(size_t bufer_size) {}
         #endif
 
 
@@ -54,10 +54,10 @@ namespace gtvr::router {
     {
         private:
             const boost::beast::http::request<boost::beast::http::string_body>& request;
-            const RouterParams& params;
+            const RouteParams& params;
             
         public:
-            inline HttpRequest(const boost::beast::http::request<boost::beast::http::string_body>& request, const RouterParams& params):request(request), params(params)
+            inline HttpRequest(const boost::beast::http::request<boost::beast::http::string_body>& request, const RouteParams& params):request(request), params(params)
             {
             }
 
@@ -134,7 +134,7 @@ namespace gtvr::router {
                 public:
                     Route(std::set<boost::beast::http::verb> methods, const std::string& path, const std::vector<Handler>& pre_middlewares, Handler handler, const std::vector<Handler>& post_middlewares);
 
-                    bool PathMatch(std::string_view input, RouterParams& params) const;
+                    bool PathMatch(std::string_view input, RouteParams& params) const;
                     
                     bool MethodMatch(boost::beast::http::verb method) const;
 
@@ -156,10 +156,10 @@ namespace gtvr::router {
             std::vector<Route> routes_;
             
             size_t paramsBufferSize = 1024;
-            std::optional<RouterParams> params_{std::nullopt};
+            std::optional<RouteParams> params_{std::nullopt};
 
         public:
-            inline const RouterParams& getRouterPamasObject() { return params_.value(); }
+            inline const RouteParams& getRouteParamsObject() { return params_.value(); }
         
             void setNotFoundHandler(Handler handler);
 

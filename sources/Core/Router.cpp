@@ -57,7 +57,7 @@ namespace gtvr::router {
         pattern = std::make_unique<RE2>(regex_pattern);
     }
 
-    bool Router::Route::PathMatch(std::string_view input, RouterParams& params) const
+    bool Router::Route::PathMatch(std::string_view input, RouteParams& params) const
     {      
         // We need N + 1 slots: index 0 is the full match, 1..N are our parameters
         int num_params = static_cast<int>(param_names.size());
@@ -221,7 +221,7 @@ namespace gtvr::router {
 
             for (const auto& route : routes_)
             {
-                if (route.PathMatch(path, const_cast<RouterParams&>(params_.value())))
+                if (route.PathMatch(path, const_cast<RouteParams&>(params_.value())))
                 {
                     path_matched = true;
 
@@ -256,7 +256,7 @@ namespace gtvr::router {
             {
                 if (url.has_value())
                 {
-                    if (route.PathMatch(path, const_cast<RouterParams&>(params_.value())))
+                    if (route.PathMatch(path, const_cast<RouteParams&>(params_.value())))
                     {
                         route(session);
                         return;

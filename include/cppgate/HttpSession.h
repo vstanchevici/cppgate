@@ -339,7 +339,7 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
                 bool req_keep_alive = parser_->keep_alive();
 
                 gtvr::router::HttpResponse res;
-                gtvr::router::HttpRequest req(parser_->get(), router->getRouterPamasObject());
+                gtvr::router::HttpRequest req(parser_->get(), router->getRouteParamsObject());
                 router->route(req, res);
 
                 queue_write(boost::beast::http::message_generator(std::move(res)), router);

@@ -9,11 +9,15 @@ else
 fi
 
 OPTIONS=(
-      --output-folder=../build/xcode/conan_libs
+      --output-folder=../build/xcode
       --build=missing
       --settings=build_type=$BUILD_TYPE
       --profile ./xcode.profile
-      ./conanfile.txt
+      -c tools.cmake.cmaketoolchain:generator=Xcode
+      -c user.build:folder_name=xcode
+      conanfile.py
 )
+
+conan editable add ./
 
 conan install ${OPTIONS[@]}

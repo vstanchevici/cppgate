@@ -41,37 +41,34 @@ class CppGateRecipe(ConanFile):
             self.options.rm_safe("fPIC")
 
     def layout(self):
-        cmake_layout(self)
+        custom_name = self.conf.get("user.build:folder_name", os.getenv("CONAN_FOLDER_NAME", "common"))
 
-        # Use the current build_type setting to point to the right folder
-        bt = str(self.settings.build_type) # Usually "Debug" or "Release"
+        base_path = os.path.dirname(os.path.dirname(__file__))
+        build_path = os.path.join(base_path, "build", custom_name)
+        #gen = self.conf.get("tools.cmake.cmaketoolchain:generator")
+        #cmake_layout(self, generator=gen, build_folder=my_custom_path, src_folder="..")
 
-        # This creates the absolute path:
-        lib_path = os.path.join(self.recipe_folder, "build", bt)
+        # Standard Conan layout anchored to your custom path
+        cmake_layout(self, build_folder=build_path, src_folder="..")
 
-        self.cpp.source.includedirs = ["include"]
+        # Detect the Build Type (Debug/Release)
+        bt = str(self.settings.build_type)
+        
+        # Logic for binary discovery
+        # If using Xcode/MSVC, we need to point to the sub-folder
+        # self.conf.get("tools.cmake.cmaketoolchain:generator") is how we check
+        gen = str(self.conf.get("tools.cmake.cmaketoolchain:generator", ""))
+        
+        if "Visual" in gen or "Xcode" in gen:
+            # Look in build/xcode/Debug
+            self.cpp.build.libdirs = [os.path.join(self.folders.build, bt)]
+        else:
+            # Look in build/common (for Make/Ninja)
+            self.cpp.build.libdirs = [self.folders.build]
 
-        # Set the search path for editable mode
-        self.cpp.build.libdirs = [lib_path]
         self.cpp.build.libs = ["cppgate"]
 
-        # This is what the consumer sees
-        self.cpp.package.libdirs = self.cpp.build.libdirs
-        self.cpp.package.libs = ["cppgate"]
-
-        '''
-        #Handle different folder structures per platform
-        if self.settings.os == "Android":
-            # Android often puts libs in 'build/android/<arch>/Debug'
-            arch = str(self.settings.arch)
-            lib_path = os.path.join(self.recipe_folder, "build", "android", arch, bt)
-        elif self.settings.os == "Emscripten":
-            # Emscripten usually outputs .a or .js files
-            lib_path = os.path.join(self.recipe_folder, "build", "wasm", bt)
-        else:
-            # Default for MSVC/Windows
-            lib_path = os.path.join(self.recipe_folder, "build", bt)
-        '''
+        self.cpp_info.libdirs = self.cpp.build.libdirs
 
     def requirements(self):
         self.requires("boost/1.86.0")
