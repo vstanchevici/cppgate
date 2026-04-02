@@ -111,10 +111,8 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE "META_VERSION=${META_VERSION}
 target_compile_definitions(${PROJECT_NAME} PRIVATE "META_NAME_VERSION=${META_NAME_VERSION}")
 
 
-get_target_property(target_type ${PROJECT_NAME} TYPE)
-
-if (NOT target_type STREQUAL "SHARED_LIBRARY")
-    target_compile_definitions(${PROJECT_NAME} PUBLIC CPPGATE_EXPORT_STATIC)
+if (NOT BUILD_SHARED_LIBS)
+    target_compile_definitions(${PROJECT_NAME} PUBLIC "CPPGATE_API=")
 endif()
 
 # Create version file

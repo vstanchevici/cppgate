@@ -9,12 +9,14 @@ if "%~1"=="" (
 )
 
 set OPTIONS= ^
-      --output-folder=../ ^
+      --output-folder=../build/vs2022 ^
       --build=missing ^
       --settings=build_type=%BUILD_TYPE% ^
       --profile ./msvc.profile ^
-      ../conanfile.py
+      -c tools.cmake.cmaketoolchain:generator="Visual Studio 17 2022" ^
+      -c user.build:folder_name=vs2022 ^
+      conanfile.py
 
-conan editable add ../
+conan editable add ./
 
 conan install %OPTIONS%

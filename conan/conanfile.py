@@ -2,7 +2,7 @@ from conan import ConanFile
 from conan.tools.cmake import CMakeToolchain, CMake, cmake_layout, CMakeDeps
 import os
 
-class CppGateRecipe(ConanFile):
+class CppGateConan(ConanFile):
     name = "cppgate"
     version = "0.1.0"
     package_type = "library"
@@ -41,6 +41,7 @@ class CppGateRecipe(ConanFile):
             self.options.rm_safe("fPIC")
 
     def layout(self):
+        os_name = str(self.settings.os)
         custom_name = self.conf.get("user.build:folder_name", os.getenv("CONAN_FOLDER_NAME", "common"))
 
         base_path = os.path.dirname(os.path.dirname(__file__))
@@ -59,15 +60,18 @@ class CppGateRecipe(ConanFile):
         # self.conf.get("tools.cmake.cmaketoolchain:generator") is how we check
         gen = str(self.conf.get("tools.cmake.cmaketoolchain:generator", ""))
         
+        lib_path = lib_path = self.folders.build  # Look in build/common (for Make/Ninja)
+
         if "Visual" in gen or "Xcode" in gen:
             # Look in build/xcode/Debug
-            self.cpp.build.libdirs = [os.path.join(self.folders.build, bt)]
-        else:
-            # Look in build/common (for Make/Ninja)
-            self.cpp.build.libdirs = [self.folders.build]
+            lib_path = os.path.join(self.folders.build, bt)                      
+
+        if os_name == "Windows":
+            lib_path = lib_path.replace("\\", "/")
+        
+        self.cpp.build.libdirs = [lib_path]
 
         self.cpp.build.libs = ["cppgate"]
-
         self.cpp_info.libdirs = self.cpp.build.libdirs
 
     def requirements(self):
@@ -96,6 +100,6 @@ class CppGateRecipe(ConanFile):
         self.cpp_info.libs = ["cppgate"]
 
         if not self.options.shared:
-            self.cpp_info.defines = ["CPPGATE_EXPORT_STATIC"]
+            self.cpp_info.defines = ["CPPGATE_API="]
 
 

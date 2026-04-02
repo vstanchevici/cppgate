@@ -111,7 +111,7 @@ namespace gtvr::router {
     using WebSocketHandler  = std::function<bool(std::shared_ptr<WebSocketSessionInterface>)>;
     using Handler           = std::variant<HttpHandler, WebSocketHandler>;
    
-    class CPPGATE_EXPORT Router
+    class CPPGATE_API Router
     {
         private:
         

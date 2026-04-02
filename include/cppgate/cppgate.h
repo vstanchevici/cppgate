@@ -20,17 +20,15 @@
 
 
 // --- Export/Import Logic ---
-#ifdef CPPGATE_EXPORT_STATIC
-#	define CPPGATE_EXPORT
-#else
+#ifndef CPPGATE_API
 #	if defined(_WIN32) || defined(__CYGWIN__)
 #		ifdef cppgate_EXPORTS
-#			define CPPGATE_EXPORT __declspec(dllexport)
+#			define CPPGATE_API __declspec(dllexport)
 #		else
-#			define CPPGATE_EXPORT __declspec(dllimport)
+#			define CPPGATE_API __declspec(dllimport)
 #		endif
 #	else
 #		// Linux/Android/macOS
-#		define CPPGATE_EXPORT __attribute__((visibility("default")))
+#		define CPPGATE_API __attribute__((visibility("default")))
 #	endif
 #endif
