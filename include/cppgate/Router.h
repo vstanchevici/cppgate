@@ -57,6 +57,51 @@ namespace gtvr::router {
             const RouteParams& params;
             
         public:
+            struct Headers
+            {
+                private:
+                    const boost::system::result<boost::urls::url_view> url_view;
+                
+            };
+        
+            struct Queries
+            {
+                private:
+                    const boost::system::result<boost::urls::url_view> url_view;
+                    boost::urls::params_view params;
+                
+                public:
+                    Queries(boost::system::result<boost::urls::url_view> url_view): url_view(url_view)
+                    {
+                        if (url_view.has_value())
+                            params = url_view.value().params();
+                    };
+                
+                    inline bool empty()
+                    {
+                        return params.empty();
+                    }
+                
+                    inline auto begin() const { return params.begin(); }
+                    inline auto end() const   { return params.end(); }
+                
+                    inline bool contains(std::string_view name) const
+                    {
+                        return params.contains(name);
+                    }
+                
+                    inline std::string get(std::string name)
+                    {
+                        auto iter = params.find(name);
+
+                        if (iter == params.end())
+                            return "";
+
+                        return (*iter).value;
+                    }
+            };
+        
+        public:
             inline HttpRequest(const boost::beast::http::request<boost::beast::http::string_body>& request, const RouteParams& params):request(request), params(params)
             {
             }
@@ -65,15 +110,24 @@ namespace gtvr::router {
             {
                 return boost::urls::parse_uri_reference(request.target());
             }
-
-            inline std::string getQuery(boost::system::result<boost::urls::url_view>& queries, std::string name)
+        
+            inline Headers headers()
             {
-                auto iter = queries.value().params().find(name);
-
-                if (iter == queries.value().params().end())
-                    return "";
-
-                return (*iter).value;
+                request
+            }
+        
+            Queries getQueries(bool strict = false)
+            {
+                if (strict)
+                {
+                    boost::system::result<boost::urls::url_view> url_view = boost::urls::parse_origin_form(request.target());
+                    return Queries(url_view);
+                }
+                else
+                {
+                    boost::system::result<boost::urls::url_view> url_view = boost::urls::parse_uri_reference(request.target());
+                    return Queries(url_view);
+                }
             }
 
             inline std::string_view getParam(const std::string& key) const
