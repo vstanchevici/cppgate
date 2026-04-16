@@ -16,6 +16,8 @@
 #include <boost/beast/http.hpp>
 #include <boost/url/urls.hpp>
 #include <boost/url/parse.hpp>
+#include <boost/url/parse_query.hpp>
+#include <boost/beast/http/rfc7230.hpp>
 #include <cppgate/WebSocketSessionInterface.h>
 #include <cppgate/cppgate.h>
 
@@ -60,23 +62,25 @@ namespace gtvr::router {
             struct Headers
             {
                 private:
-                    const boost::system::result<boost::urls::url_view> url_view;
-                
+                    const boost::beast::http::request<boost::beast::http::string_body>& request;
+
+                public:
+                    Headers(const boost::beast::http::request<boost::beast::http::string_body>& request):request(request) {}
+
+                    inline auto begin() const { return request.begin(); }
+                    inline auto end() const { return request.end(); }
             };
         
             struct Queries
             {
                 private:
-                    const boost::system::result<boost::urls::url_view> url_view;
                     boost::urls::params_view params;
                 
                 public:
-                    Queries(boost::system::result<boost::urls::url_view> url_view): url_view(url_view)
+                    Queries(boost::urls::params_view params): params(params)
                     {
-                        if (url_view.has_value())
-                            params = url_view.value().params();
                     };
-                
+
                     inline bool empty()
                     {
                         return params.empty();
@@ -113,24 +117,64 @@ namespace gtvr::router {
         
             inline Headers headers()
             {
-                request
+                return Headers(request);
             }
         
-            Queries getQueries(bool strict = false)
+            Queries formQueries()
             {
-                if (strict)
+                if (request[boost::beast::http::field::content_type] == "application/x-www-form-urlencoded")
                 {
-                    boost::system::result<boost::urls::url_view> url_view = boost::urls::parse_origin_form(request.target());
-                    return Queries(url_view);
+                    auto result = boost::urls::parse_query(request.body());
+                    if (result)
+                        return Queries(result.value());
                 }
-                else
+                return Queries(boost::urls::params_view{});
+            }
+
+            template<bool strict = false>
+            Queries urlQueries()
+            {
+                auto result = (strict)
+                    ? boost::urls::parse_origin_form(request.target())
+                    : boost::urls::parse_uri_reference(request.target());
+
+                return result ? Queries(result->params()) : Queries({});
+            }
+
+            template<bool with_attributes = false>
+            void parseHeader(boost::beast::http::field header)
+            {
+                auto it = request.find(header);
+                if (it != request.end())
                 {
-                    boost::system::result<boost::urls::url_view> url_view = boost::urls::parse_uri_reference(request.target());
-                    return Queries(url_view);
+                    if constexpr (with_attributes)
+                    {
+                        boost::beast::http::ext_list list{ it->value() };
+
+                        for (auto const& param : list) {
+                            // param.first is the encoding (e.g., "gzip")
+                            // param.second is the list of attributes (e.g., "q=0.8")
+                            std::cout << "Encoding: " << param.first << "\n";
+                            for (auto const& attr : param.second) {
+                                std::cout << "  Attr: " << attr.first << " = " << attr.second << "\n";
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // token_list parses the "gzip, deflate, br" string into iterable tokens
+                        boost::beast::http::token_list tokens{ it->value() };
+
+                        for (auto const& token : tokens) {
+                            if (token == "gzip") {
+                                // Setup compression...
+                            }
+                        }
+                    }
                 }
             }
 
-            inline std::string_view getParam(const std::string& key) const
+            inline std::string_view urlParam(const std::string& key) const
             {
                 return params.get(key);
             }
@@ -145,7 +189,7 @@ namespace gtvr::router {
                 return request.method();
             }
 
-            inline auto keep_alive()
+            inline auto keepAlive()
             {
                 return request.keep_alive();
             }
