@@ -69,6 +69,24 @@ namespace gtvr::router {
 
                     inline auto begin() const { return request.begin(); }
                     inline auto end() const { return request.end(); }
+
+                    inline std::string_view get(boost::beast::http::field header)
+                    {
+                        auto it = request.find(header);
+                        if (it == request.end())
+                            return {};
+                        else
+                            return it->value();
+                    }
+
+                    inline std::string_view get(std::string_view header)
+                    {
+                        auto it = request.find(header);
+                        if (it == request.end())
+                            return {};
+                        else
+                            return it->value();
+                    }
             };
         
             struct Queries
