@@ -4,7 +4,7 @@
 namespace gtvr::router {
 
     Router::Route::Route(std::set<boost::beast::http::verb> methods, const std::string& path, const std::vector<Handler>& pre_middlewares, Handler handler, const std::vector<Handler>& post_middlewares) :
-        methods(methods), path(std::move(path)), handler(handler), post_middlewares(post_middlewares)
+        methods(methods), path(std::move(path)), handler(handler), pre_middlewares(pre_middlewares), post_middlewares(post_middlewares)
     {
         createRegexPattern();
     }
@@ -87,39 +87,55 @@ namespace gtvr::router {
 
     void Router::Route::operator()(HttpRequest& request, HttpResponse& response) const
     {
+        bool next_one = true;
+
         for (auto& middleware : pre_middlewares)
         {
-            bool result = std::get<HttpHandler>(middleware)(request, response);
-            if (!result)
+            next_one = std::get<HttpHandler>(middleware)(request, response);
+            if (next_one == false)
                 break;
         }
 
-        std::get<HttpHandler>(handler)(request, response);
-
-        for (auto& middleware : post_middlewares)
+        if (next_one)
         {
-            bool result = std::get<HttpHandler>(middleware)(request, response);            
-            if (!result)
-                break;
+            next_one = std::get<HttpHandler>(handler)(request, response);
+
+            if (next_one)
+            {
+                for (auto& middleware : post_middlewares)
+                {
+                    next_one = std::get<HttpHandler>(middleware)(request, response);
+                    if (next_one == false)
+                        break;
+                }
+            }
         }
     }        
 
     void Router::Route::operator()(std::shared_ptr<WebSocketSessionInterface> session) const
     {  
+        bool next_one = true;
+
         for (auto& middleware : pre_middlewares)
         {
-            bool result = std::get<WebSocketHandler>(middleware)(session);
-            if (!result)
+            next_one = std::get<WebSocketHandler>(middleware)(session);
+            if (next_one == false)
                 break;
         }
 
-        std::get<WebSocketHandler>(handler)(session);
-
-        for (auto& middleware : post_middlewares)
+        if (next_one)
         {
-            bool result = std::get<WebSocketHandler>(middleware)(session);
-            if (!result)
-                break;
+            next_one = std::get<WebSocketHandler>(handler)(session);
+
+            if (next_one)
+            {
+                for (auto& middleware : post_middlewares)
+                {
+                    next_one = std::get<WebSocketHandler>(middleware)(session);
+                    if (next_one == false)
+                        break;
+                }
+            }
         }
     }
 
@@ -166,9 +182,9 @@ namespace gtvr::router {
         auto entry = Route{
             {},
             std::move(path),
-            {},
+            std::move(pre_middlewares),
             std::move(handler),
-            {}
+            std::move(post_middlewares)
         };
 
         // Safety check: Ensure the regex compiled successfully
@@ -186,7 +202,7 @@ namespace gtvr::router {
         auto entry = Route{
             std::move(methods),
             std::move(path),
-            {},
+            std::move(pre_middlewares),
             std::move(handler),
             std::move(post_middlewares)
         };
@@ -205,7 +221,6 @@ namespace gtvr::router {
         if ((paramsBufferSize > 0) && (!params_.has_value()))
         {
             params_.emplace(paramsBufferSize);
-            std::cout << "ONE TIME" << std::endl;
         }
     }
 

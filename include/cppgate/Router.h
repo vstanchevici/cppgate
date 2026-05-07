@@ -133,11 +133,16 @@ namespace gtvr::router {
                 return boost::urls::parse_uri_reference(request.target());
             }
         
-            inline Headers headers()
+            inline auto headers()
             {
                 return Headers(request);
             }
         
+            inline auto body()
+            {
+                return request.body();
+            }
+
             Queries formQueries()
             {
                 if (request[boost::beast::http::field::content_type] == "application/x-www-form-urlencoded")
@@ -220,13 +225,65 @@ namespace gtvr::router {
 
     struct HttpResponse : public boost::beast::http::response<boost::beast::http::string_body>
     {
-        
+     
+        void setContent(std::string content, const std::string_view content_type)
+        {
+            set(boost::beast::http::field::content_type, content_type);
+            body() = content;
+            prepare_payload();
+        }
     };
 
     using HttpHandler       = std::function<bool(HttpRequest&, HttpResponse&)>;
     using WebSocketHandler  = std::function<bool(std::shared_ptr<WebSocketSessionInterface>)>;
     using Handler           = std::variant<HttpHandler, WebSocketHandler>;
    
+
+    /*
+    
+    // Usage:
+        HeavyObject o1;
+        auto o2 = std::make_shared<HeavyObject>();
+
+        auto c1 = HandlerWrapper(&o1);   // Works with pointer
+        auto c2 = HandlerWrapper(o1);    // Works by value
+        auto c3 = HandlerWrapper(o2);    // Works with shared_ptr
+
+        or use 
+        auto c = ToHandler(&o1); //&o1, o1, o2
+    */
+    template <typename T>
+    class HandlerWrapper {
+        private:
+            T data;
+
+        public:
+            // The constructor that allows CTAD to work
+            explicit HandlerWrapper(T val) : data(std::move(val)) {}
+
+            template <typename... Args>
+            auto operator()(Args&&... args) const {
+                if constexpr (std::is_pointer_v<T>) {
+                    return (*data)(std::forward<Args>(args)...);
+                }
+                else if constexpr (requires { data.operator->(); }) {
+                    return (*data)(std::forward<Args>(args)...);
+                }
+                else {
+                    return data(std::forward<Args>(args)...);
+                }
+            }
+    };
+
+    template <typename T>
+    HandlerWrapper(T) -> HandlerWrapper<T>;
+
+
+    template <typename T>
+    auto ToHandler(T&& val) {
+        return HandlerWrapper<std::decay_t<T>>(std::forward<T>(val));
+    }
+
     class CPPGATE_API Router
     {
         private:
