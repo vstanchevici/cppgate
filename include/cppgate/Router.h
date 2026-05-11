@@ -229,16 +229,37 @@ namespace gtvr::router {
             }
     };
 
-    struct HttpResponse : public boost::beast::http::response<boost::beast::http::string_body>
+    struct HttpResponse
     {
-     
-        void setContent(std::string content, const std::string_view content_type)
-        {
-            set(boost::beast::http::field::content_type, content_type);
-            body() = content;
-            prepare_payload();
-        }
+        private:
+            boost::beast::http::response<boost::beast::http::string_body> beast_res_;
+
+        public:
+            /*
+            operator boost::beast::http::response<boost::beast::http::string_body>&&()
+            {
+                return std::move(beast_res_);
+            }
+            */
+
+            bool keep_alive()
+            {
+                return beast_res_.keep_alive();
+            }
+        
+            void Send()
+            {
+                
+            }
+        
+            void setContent(std::string content, const std::string_view content_type)
+            {
+                set(boost::beast::http::field::content_type, content_type);
+                body() = content;
+                prepare_payload();
+            }
     };
+
 
     using HttpHandler       = std::function<bool(HttpRequest&, HttpResponse&)>;
     using WebSocketHandler  = std::function<bool(std::shared_ptr<WebSocketSessionInterface>)>;
