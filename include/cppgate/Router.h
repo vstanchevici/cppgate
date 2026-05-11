@@ -29,12 +29,12 @@ namespace gtvr::router {
             private:
                 std::unique_ptr<std::byte[]> buffer;
             
-                std::pmr::monotonic_buffer_resource pool;
+                std::pmr::monotonic_buffer_resource resource;
         
             public:
                 std::pmr::vector<std::pair<std::string_view, std::string_view>> params;
 
-                RouteParams(size_t bufer_size): buffer(std::make_unique<std::byte[]>(bufer_size)), pool(buffer.get(), bufer_size), params(&pool) {}
+                RouteParams(size_t bufer_size): buffer(std::make_unique<std::byte[]>(bufer_size)), resource(buffer.get(), bufer_size, std::pmr::null_memory_resource()), params(&resource) {}
         #else
             public:
                 std::vector<std::pair<std::string_view, std::string_view>> params;
@@ -49,6 +49,12 @@ namespace gtvr::router {
                     if (k == key) return v;
                 }
                 return {};
+            }
+
+            void reset()
+            {
+                params.clear();
+                resource.release();
             }
     };
    
