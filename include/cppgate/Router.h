@@ -6,7 +6,6 @@
 #endif
 
 #include <cppgate/Log.h>
-#include <iostream>
 #include <string>
 #include <vector>
 #include <set>
@@ -20,6 +19,7 @@
 #include <boost/beast/http/rfc7230.hpp>
 #include <cppgate/WebSocketSessionInterface.h>
 #include <cppgate/cppgate.h>
+#include <cppgate/RingBuffer.h>
 
 namespace gtvr::router {
 
@@ -56,15 +56,30 @@ namespace gtvr::router {
                 params.clear();
                 resource.release();
             }
+
+            // Delete copy/move to prevent accidental misuse of the PMR resource
+            RouteParams(const RouteParams&) = delete;
+            RouteParams(RouteParams&&) = delete;
     };
    
     struct HttpRequest
     {
         private:
-            const boost::beast::http::request<boost::beast::http::string_body>& request;
-            const RouteParams& params;
-            
+            const boost::beast::http::request<boost::beast::http::string_body>& request;            
+            void* context;
+
         public:
+            RouteParams* params;
+
+            void setContext(void* ptr) noexcept {
+                context = ptr;
+            }
+
+            template<typename T>
+            T* getContext() const noexcept {
+                return static_cast<T*>(context);
+            }
+
             struct Headers
             {
                 private:
@@ -130,7 +145,7 @@ namespace gtvr::router {
             };
         
         public:
-            inline HttpRequest(const boost::beast::http::request<boost::beast::http::string_body>& request, const RouteParams& params):request(request), params(params)
+            inline HttpRequest(const boost::beast::http::request<boost::beast::http::string_body>& request):request(request), params(nullptr), context(nullptr)
             {
             }
 
@@ -183,9 +198,9 @@ namespace gtvr::router {
                         for (auto const& param : list) {
                             // param.first is the encoding (e.g., "gzip")
                             // param.second is the list of attributes (e.g., "q=0.8")
-                            std::cout << "Encoding: " << param.first << "\n";
+                            //std::cout << "Encoding: " << param.first << "\n";
                             for (auto const& attr : param.second) {
-                                std::cout << "  Attr: " << attr.first << " = " << attr.second << "\n";
+                                //std::cout << "  Attr: " << attr.first << " = " << attr.second << "\n";
                             }
                         }
                     }
@@ -205,7 +220,7 @@ namespace gtvr::router {
 
             inline std::string_view urlParam(const std::string& key) const
             {
-                return params.get(key);
+                return params->get(key);
             }
 
             inline auto target()
@@ -216,6 +231,11 @@ namespace gtvr::router {
             inline auto method()
             {
                 return request.method();
+            }
+
+            inline auto method_string()
+            {
+                return request.method_string();
             }
 
             inline auto keepAlive()
@@ -231,37 +251,102 @@ namespace gtvr::router {
 
     struct HttpResponse
     {
-        private:
-            boost::beast::http::response<boost::beast::http::string_body> beast_res_;
-
         public:
-            /*
-            operator boost::beast::http::response<boost::beast::http::string_body>&&()
-            {
-                return std::move(beast_res_);
-            }
-            */
+            boost::beast::http::response<boost::beast::http::string_body> beast_res_;;                    
 
-            bool keep_alive()
+            inline bool keepAlive()
             {
                 return beast_res_.keep_alive();
             }
         
-            void Send()
+            inline void keepAlive(bool keep_alive)
             {
-                
+                beast_res_.keep_alive(keep_alive);
+            }
+
+            inline void header(boost::beast::http::field name, std::string_view const& value)
+            {
+                beast_res_.set(name, value);
+            }
+
+            inline void header(std::string_view sname, std::string_view const& value)
+            {
+                beast_res_.set(sname, value);
+            }
+
+            inline void version(unsigned int version)
+            {
+                beast_res_.version(version);
             }
         
-            void setContent(std::string content, const std::string_view content_type)
+            inline bool hasResponse()
             {
-                set(boost::beast::http::field::content_type, content_type);
-                body() = content;
-                prepare_payload();
+                return beast_res_.result_int() != 0;
+            }
+
+            /*
+            *   Some code status
+            *
+            *   https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Status/500
+            */
+
+            void send(boost::beast::http::status status, const std::string_view content, std::string_view const& content_type)
+            {
+                beast_res_.set(boost::beast::http::field::content_type, content_type);
+                beast_res_.result(status);
+                beast_res_.body() = content;
+                beast_res_.prepare_payload();
+            }
+
+            void send(boost::beast::http::status status, const std::string_view content)
+            {
+                beast_res_.result(status);
+                beast_res_.body() = content;
+                beast_res_.prepare_payload();
+            }
+
+            void send(const std::string_view content, std::string_view const& content_type)
+            {
+                beast_res_.set(boost::beast::http::field::content_type, content_type);
+                beast_res_.result(boost::beast::http::status::ok);
+                beast_res_.body() = content;
+                beast_res_.prepare_payload();
+            }
+
+            inline void sendNoContent()
+            {
+                beast_res_.result(boost::beast::http::status::no_content);
+            }
+
+            void sendContent(const std::string_view content)
+            {
+                beast_res_.result(boost::beast::http::status::ok);
+                beast_res_.body() = content;
+                beast_res_.prepare_payload();
+            }
+
+            void sendNotFound(const std::string_view content)
+            {
+                beast_res_.result(boost::beast::http::status::not_found);
+                beast_res_.body() = content;
+                beast_res_.prepare_payload();
+            }
+
+            void sendUnauthorized(const std::string_view content)
+            {
+                beast_res_.result(boost::beast::http::status::unauthorized);
+                beast_res_.body() = content;
+                beast_res_.prepare_payload();
+            }
+
+            inline void sendJSON(const std::string_view content)
+            {
+                send(content, "application/json"); // maybe another function with "text/plain");
             }
     };
 
 
-    using HttpHandler       = std::function<bool(HttpRequest&, HttpResponse&)>;
+    using HttpHandler       = std::function<void(HttpRequest&, HttpResponse&)>;
     using WebSocketHandler  = std::function<bool(std::shared_ptr<WebSocketSessionInterface>)>;
     using Handler           = std::variant<HttpHandler, WebSocketHandler>;
    
@@ -344,23 +429,22 @@ namespace gtvr::router {
 
         private:
             Handler not_found_handler = [](HttpRequest& request, HttpResponse& response) {
-                std::cout << "404 Not Found: " << request.target() << "\n";
-                return true;
+                response.sendNotFound("Handler not found");
             };
 
             Handler method_not_allowed_handler = [](HttpRequest& request, HttpResponse& response) {
-                std::cout << "405 Method Not Allowed: " << request.target() << "\n";
-                return true;
+                response.send(boost::beast::http::status::method_not_allowed , "Method Not Allowed");
             };
 
-            std::vector<Route> routes_;
-            
-            size_t paramsBufferSize = 1024;
-            std::optional<RouteParams> params_{std::nullopt};
+            Handler internal_server_error_handler = [](HttpRequest& request, HttpResponse& response) {
+                response.send(boost::beast::http::status::internal_server_error, "Internal Server Errord");
+            };
 
-        public:
-            inline const RouteParams& getRouteParamsObject() { return params_.value(); }
-        
+            std::vector<Route>                          routes_;
+            std::vector<std::unique_ptr<RouteParams>>   buffers_;
+            std::unique_ptr<RingBuffer<RouteParams*>>   params_;
+            
+        public:        
             void setNotFoundHandler(Handler handler);
 
             void setMethodNotAllowedHandler(Handler handler);
@@ -377,10 +461,10 @@ namespace gtvr::router {
             void add(std::set<boost::beast::http::verb> methods, const std::string& path, const std::vector<Handler>& pre_middlewares, HttpHandler handler, const std::vector<Handler>& post_middlewares = {});
             inline void add(std::set<boost::beast::http::verb> methods, const std::string& path, HttpHandler handler, const std::vector<Handler>& post_middlewares = {}) { add(methods, path, {}, handler, post_middlewares); }
         
-            void route(HttpRequest& request, HttpResponse& response) const;
-            void route(std::shared_ptr<WebSocketSessionInterface> session) const;
+            void route(HttpRequest& request, HttpResponse& response);
+            void route(std::shared_ptr<WebSocketSessionInterface> session);
 
-            void prepare();
+            void initialize(size_t buffersCount, size_t bufferSize);
 
     };	
 

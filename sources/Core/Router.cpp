@@ -87,25 +87,23 @@ namespace gtvr::router {
 
     void Router::Route::operator()(HttpRequest& request, HttpResponse& response) const
     {
-        bool next_one = true;
-
         for (auto& middleware : pre_middlewares)
-        {
-            next_one = std::get<HttpHandler>(middleware)(request, response);
-            if (next_one == false)
+        {           
+            std::get<HttpHandler>(middleware)(request, response);
+            if (response.hasResponse())
                 break;
         }
 
-        if (next_one)
+        if (!response.hasResponse())
         {
-            next_one = std::get<HttpHandler>(handler)(request, response);
+            std::get<HttpHandler>(handler)(request, response);
 
-            if (next_one)
+            if (!response.hasResponse())
             {
                 for (auto& middleware : post_middlewares)
                 {
-                    next_one = std::get<HttpHandler>(middleware)(request, response);
-                    if (next_one == false)
+                    std::get<HttpHandler>(middleware)(request, response);
+                    if (response.hasResponse())
                         break;
                 }
             }
@@ -216,15 +214,31 @@ namespace gtvr::router {
         routes_.push_back(std::move(entry));
     }
 
-    void Router::prepare()
+    void Router::initialize(size_t buffersCount, size_t bufferSize)
     {
-        if ((paramsBufferSize > 0) && (!params_.has_value()))
-        {
-            params_.emplace(paramsBufferSize);
+        // Resize the vector to hold the actual objects.
+        // This allocates the memory for all RouteParams instances.
+        buffers_.reserve(buffersCount);
+
+        params_ = std::make_unique<RingBuffer<RouteParams*>>();
+        params_->create(buffersCount);
+
+        for (size_t i = 0; i < buffersCount; ++i) {           
+            // Create the object on the heap
+            auto new_buffer = std::make_unique<RouteParams>(bufferSize);
+
+            // Store the raw pointer in the RingBuffer BEFORE moving ownership
+            // This is safe because the unique_ptr still owns it here.
+            if (!params_->push(new_buffer.get())) {
+                throw std::runtime_error("RingBuffer push failed");
+            }
+
+            // Move ownership into the vector
+            buffers_.push_back(std::move(new_buffer));
         }
     }
 
-    void Router::route(HttpRequest& request, HttpResponse& response) const
+    void Router::route(HttpRequest& request, HttpResponse& response)
     {
         bool path_matched = false;
 
@@ -234,32 +248,59 @@ namespace gtvr::router {
         {
             auto path = url.value().path();
 
-            for (const auto& route : routes_)
+            if (params_->pop(request.params))
             {
-                if (route.PathMatch(path, const_cast<RouteParams&>(params_.value())))
-                {
-                    path_matched = true;
+                request.params->reset();
 
-                    if (route.MethodMatch(request.method()))
+                for (const auto& route : routes_)
+                {
+                    if (route.PathMatch(path, const_cast<RouteParams&>(*request.params)))
                     {
-                        route(request, response);
-                        return;
+                        path_matched = true;
+
+                        if (route.MethodMatch(request.method()))
+                        {
+                            bool internal_server_error = false;
+
+                            try {
+                                route(request, response);
+
+                                internal_server_error = response.hasResponse() == false;
+                            }
+                            catch (...)
+                            {
+                                internal_server_error = true;
+                            }
+
+                            if (internal_server_error)
+                                std::get<HttpHandler>(internal_server_error_handler)(request, response);        // 500
+
+                            params_->push(request.params);
+
+                            return;
+                        }
                     }
                 }
-            }
 
-            if (path_matched)
-                std::get<HttpHandler>(method_not_allowed_handler)(request, response);   // 405
+                if (path_matched)
+                    std::get<HttpHandler>(method_not_allowed_handler)(request, response);   // 405
+                else
+                    std::get<HttpHandler>(not_found_handler)(request, response);            // 404
+
+                params_->push(request.params);
+            }
             else
-                std::get<HttpHandler>(not_found_handler)(request, response);            // 404
+            {
+                std::get<HttpHandler>(method_not_allowed_handler)(request, response);       // 405
+            }
         }
         else
         {
-            std::get<HttpHandler>(not_found_handler)(request, response);                // 404
+            std::get<HttpHandler>(internal_server_error_handler)(request, response);        // 500
         }
     }
 
-    void Router::route(std::shared_ptr<WebSocketSessionInterface> session) const
+    void Router::route(std::shared_ptr<WebSocketSessionInterface> session)
     {
         auto url = boost::urls::parse_uri_reference(session->getRequest().target());
 
@@ -271,9 +312,15 @@ namespace gtvr::router {
             {
                 if (url.has_value())
                 {
-                    if (route.PathMatch(path, const_cast<RouteParams&>(params_.value())))
+                    RouteParams* rp;
+
+                    if (params_->pop(rp))
                     {
-                        route(session);
+                        if (route.PathMatch(path, const_cast<RouteParams&>(*rp)))
+                            route(session);
+
+                        rp->reset();
+                        params_->push(rp);
                         return;
                     }
                 }

@@ -338,15 +338,16 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
             else
             {
                 // Send the response
-                gtvr::router::HttpRequest req(parser_->get(), router->getRouteParamsObject());
+                gtvr::router::HttpRequest req(parser_->get());
+                response_.beast_res_.result(0); //We do this(=0) to test if response_ has answer
                 router->route(req, response_);
 
-                bool req_keep_alive = true;//response_.keep_alive();
-                
-                queue_write(boost::beast::http::message_generator(std::move(response_)), router);
+                bool req_keep_alive = response_.keepAlive();
 
-                response_ = {};
-                
+                queue_write(boost::beast::http::message_generator(std::move(response_.beast_res_)), router);
+
+                response_.beast_res_ = {};
+
                 // If we aren't at the queue limit, try to pipeline another request
                 if (response_queue_.size() < queue_limit)
                 {
