@@ -20,6 +20,7 @@
 #include <cppgate/WebSocketSessionInterface.h>
 #include <cppgate/cppgate.h>
 #include <cppgate/RingBuffer.h>
+#include <memory>
 
 namespace gtvr::router {
 
@@ -65,19 +66,28 @@ namespace gtvr::router {
     struct HttpRequest
     {
         private:
-            const boost::beast::http::request<boost::beast::http::string_body>& request;            
-            void* context;
+            const boost::beast::http::request<boost::beast::http::string_body>& request;
+            std::string ip;
+            std::shared_ptr<void> context;
 
         public:
             RouteParams* params;
 
-            void setContext(void* ptr) noexcept {
-                context = ptr;
+            void setContext(std::shared_ptr<void> ctx) noexcept {
+                context = ctx;
             }
 
             template<typename T>
-            T* getContext() const noexcept {
-                return static_cast<T*>(context);
+            std::shared_ptr<T> getContext() const noexcept {
+                return std::static_pointer_cast<T>(context);
+            }
+
+            void setIP(std::string& ip) noexcept {
+                this->ip = ip;
+            }
+
+            std::string& getIP() noexcept {
+                return ip;
             }
 
             struct Headers

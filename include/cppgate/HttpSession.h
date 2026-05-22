@@ -339,7 +339,26 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
             {
                 // Send the response
                 gtvr::router::HttpRequest req(parser_->get());
-                response_.beast_res_.result(0); //We do this(=0) to test if response_ has answer
+
+                //We do this(=0) to test if response_ has answer
+                response_.beast_res_.result(0);
+
+                //here we take ip and assign to request
+                std::visit([this, &req](auto& hs)
+                {
+                    boost::system::error_code ec;
+
+                    auto remote_endpoint = boost::beast::get_lowest_layer(hs).socket().remote_endpoint(ec);                    
+
+                    std::string client_ip = "UNKNOWN";
+
+                    if (!ec) {
+                        client_ip = remote_endpoint.address().to_string();
+                    }
+
+                    req.setIP(client_ip);
+                }, stream_);
+                
                 router->route(req, response_);
 
                 bool req_keep_alive = response_.keepAlive();
