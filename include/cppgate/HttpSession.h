@@ -86,14 +86,30 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
 
             if (!response_queue_.empty())
             {
-                boost::beast::http::message_generator msg = std::move(response_queue_.front());
+                auto main_executor = std::visit([](auto& hs) { return boost::beast::get_lowest_layer(hs).get_executor(); }, stream_);
 
-                bool keep_alive = msg.keep_alive();
-
-                std::visit([this, &msg, router, keep_alive](auto& hs)
+                // Post the work to guarantee thread safety
+                boost::asio::post(main_executor, [this, router]() mutable
                 {
-                    boost::beast::async_write(hs, std::move(msg), boost::beast::bind_front_handler(&HttpSession::on_write, shared_from_this(), router, keep_alive));
-                }, stream_);
+                    if (response_queue_.empty()) return;
+
+                    boost::beast::http::message_generator msg = std::move(response_queue_.front());
+                    bool keep_alive = msg.keep_alive();
+
+                    std::visit([this, msg = std::move(msg), router, keep_alive](auto& hs) mutable
+                    {
+                        auto& non_const_msg = const_cast<boost::beast::http::message_generator&>(msg);
+                        auto stream_executor = boost::beast::get_lowest_layer(hs).get_executor();
+
+                        // Anchor the handler permanently to the stream's executor
+                        auto bound_handler = boost::asio::bind_executor(
+                            stream_executor,
+                            boost::beast::bind_front_handler(&HttpSession::on_write, shared_from_this(), router, keep_alive)
+                        );
+
+                        boost::beast::async_write(hs, std::move(non_const_msg), std::move(bound_handler));
+                    }, stream_);
+                });
             }
 
             return was_full;
