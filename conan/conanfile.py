@@ -62,9 +62,11 @@ class CppGateConan(ConanFile):
         
         lib_path = lib_path = self.folders.build  # Look in build/common (for Make/Ninja)
 
-        if "Visual" in gen or "Xcode" in gen:
-            # Look in build/xcode/Debug
-            lib_path = os.path.join(self.folders.build, bt)                      
+        #if "Visual" in gen or "Xcode" in gen:
+        #    # Look in build/xcode/Debug
+        #    lib_path = os.path.join(self.folders.build, bt)
+
+        lib_path = os.path.join(self.folders.build, bt)
 
         if os_name == "Windows":
             lib_path = lib_path.replace("\\", "/")
@@ -77,7 +79,7 @@ class CppGateConan(ConanFile):
     def requirements(self):
         self.requires("boost/1.86.0")
         self.requires("re2/20240702")
-        self.requires("openssl/3.3.2")
+        self.requires("openssl/3.6.3")
         self.requires("spdlog/1.15.1")
 
     def generate(self):
