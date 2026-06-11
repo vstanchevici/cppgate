@@ -7,6 +7,9 @@ class CppGateConan(ConanFile):
     version = "0.1.0"
     package_type = "library"
 
+    # It copies everything from the parent folder (where CMakeLists.txt lives), except the build folder itself
+    exports_sources = "../CMakeLists.txt", "../sources/*", "../include/*"
+
     # Binary configuration
     settings = "os", "compiler", "build_type", "arch"
     
