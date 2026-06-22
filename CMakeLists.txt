@@ -45,7 +45,12 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 #
 
 # Get git revision
-get_git_head_revision(GIT_REFSPEC GIT_SHA1)
+if(EXISTS "${CMAKE_SOURCE_DIR}/.git")    
+    get_git_head_revision(GIT_REFSPEC GIT_SHA1)
+else()
+    set(GIT_SHA1 "unknown-build")
+endif()
+
 string(SUBSTRING "${GIT_SHA1}" 0 12 GIT_REV)
 if(NOT GIT_SHA1)
     set(GIT_REV "0")
