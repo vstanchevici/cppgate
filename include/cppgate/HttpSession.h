@@ -174,7 +174,7 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
                     // Set the timeout.
                     hs.expires_after(std::chrono::seconds(30));
 
-                    boost::beast::async_detect_ssl(hs, buffer_, boost::beast::bind_front_handler(&HttpSession::on_detect, shared_from_this(), ctx, std::move(router)));
+                    boost::beast::async_detect_ssl(hs, buffer_, boost::beast::bind_front_handler(&HttpSession::on_detect, this->shared_from_this(), ctx, std::move(router)));
                 }
             }, stream_);
         }
@@ -270,7 +270,7 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
                     
                     // Perform the SSL handshake
                     // Note, this is the buffered version of the handshake.
-                    hs.async_handshake(boost::asio::ssl::stream_base::server, buffer_.data(), boost::beast::bind_front_handler(&HttpSession::on_handshake, shared_from_this(), router));
+                    hs.async_handshake(boost::asio::ssl::stream_base::server, buffer_.data(), boost::beast::bind_front_handler(&HttpSession::on_handshake, this->shared_from_this(), router));
                 }
             }, stream_);
         }
@@ -307,7 +307,7 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
                     boost::beast::get_lowest_layer(hs).expires_after(std::chrono::seconds(30));
 
                     // Perform the SSL shutdown
-                    hs.async_shutdown(boost::beast::bind_front_handler(&HttpSession::on_shutdown, shared_from_this()));
+                    hs.async_shutdown(boost::beast::bind_front_handler(&HttpSession::on_shutdown, this->shared_from_this()));
                 }
                 else
                 {
