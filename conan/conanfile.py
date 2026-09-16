@@ -97,7 +97,7 @@ class CppGateConan(ConanFile):
     def requirements(self):
         self.requires("boost/1.86.0")
         self.requires("re2/20240702")
-        self.requires("openssl/3.6.3")
+        self.requires("openssl/3.6.4")
         self.requires("spdlog/1.15.1")
 
     def generate(self):
