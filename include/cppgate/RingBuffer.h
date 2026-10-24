@@ -83,7 +83,6 @@ public:
             cpu_relax();
         }
 
-        //std::atomic_ref<T>(slot.data).store(item, std::memory_order_relaxed);
         slot.data = item;
 
         // Signal Consumer: "It's now your turn (pos + 1)"
@@ -104,7 +103,6 @@ public:
             // If sequence == pos + 1, data is ready for us
             if (diff == 0) {
                 if (tail.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
-                    //out = std::atomic_ref<T>(slot.data).load(std::memory_order_relaxed);
                     out = slot.data;
 
                     // Signal Producer: "Slot is free for the next LAP (pos + Size)"
