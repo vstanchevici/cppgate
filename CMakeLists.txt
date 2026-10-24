@@ -131,7 +131,8 @@ set(FilesNetwork)
 find_source_files(FilesNetwork                      CXX     "${SOURCE_ROOT_PATH}/Core"
                                                             "${SOURCE_ROOT_PATH}/BoostBeast"
                                                             "${SOURCE_ROOT_PATH}/Authentication"
-                                                            "${SOURCE_ROOT_PATH}/Handlers")
+                                                            "${SOURCE_ROOT_PATH}/Handlers"
+                                                            "${SOURCE_ROOT_PATH}/Middleware")
                                                             
 foreach(_source IN ITEMS ${FilesNetwork})
     get_filename_component(_source_path "${_source}" PATH)
@@ -152,7 +153,8 @@ find_source_files(FilesNetwork                      INC     "${INCLUDE_ROOT_PATH
                                                             "${INCLUDE_ROOT_PATH}/Core"
                                                             "${INCLUDE_ROOT_PATH}/BoostBeast"
                                                             "${INCLUDE_ROOT_PATH}/Authentication"
-                                                            "${INCLUDE_ROOT_PATH}/Handlers")
+                                                            "${INCLUDE_ROOT_PATH}/Handlers"
+                                                            "${INCLUDE_ROOT_PATH}/Middleware")
 
 target_sources(${PROJECT_NAME} PRIVATE ${FilesNetwork})
 

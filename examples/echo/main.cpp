@@ -1,4 +1,5 @@
 #include <cppgate/Listener.h>
+#include <cppgate/Middleware/Cors.h>
 
 #include <boost/asio/signal_set.hpp>
 #include <boost/asio/ssl.hpp>
@@ -32,6 +33,11 @@ int main(int argc, char* argv[])
     auto router = std::make_shared<gtvr::router::Router>();
     // Behind nginx on the same machine: believe its X-Forwarded-For
     router->setTrustedProxies({ "127.0.0.1" });
+
+    // Let a front end on another origin (e.g. a dev server on port 3000) call this API from the browser
+    gtvr::middleware::CorsOptions cors;
+    cors.allowed_origins = { "http://localhost:3000" };
+    router->use(gtvr::middleware::cors(cors));
 
     router->add({ http::verb::get }, "/hello", [](gtvr::router::HttpRequest&, gtvr::router::HttpResponse& res) {
         res.send("hello from cppgate", "text/plain");

@@ -6,10 +6,11 @@ A C++20 HTTP and WebSocket server library built on Boost.Beast and Boost.Asio: a
 
 ## Features
 
-- **Router**: paths with parameters (`/users/{id}`, `/items/{id:\d+}`), method sets, groups with prefixes, pre/post middleware, custom 404/405 handlers, 500 on exceptions. Patterns use RE2, so a route can't trigger catastrophic regex backtracking.
+- **Router**: paths with parameters (`/users/{id}`, `/items/{id:\d+}`), method sets, groups with prefixes, global and per-route middleware, custom 404/405 handlers, 500 on exceptions. Patterns use RE2, so a route can't trigger catastrophic regex backtracking.
 - **WebSocket routes** with the same router and middleware: the upgrade can be refused with a real HTTP status before the handshake, and callbacks (`onMessage`, `onClose`, `onError`) are set per connection.
 - **HTTP and HTTPS on one port** (TLS detected per connection), or HTTPS only. WSS works the same way.
 - **Limits and errors**: header/body limits with proper `400`/`413`/`414`/`431` responses, `Expect: 100-continue`, timeouts, slow WebSocket clients disconnected instead of buffering without limit.
+- **CORS** middleware, preflight included.
 - **Client IP behind reverse proxies** (`X-Forwarded-For`, `X-Real-IP`), only trusted from proxies you declare.
 - **Graceful shutdown**: stop accepting, finish requests in progress, close WebSockets with 1001.
 
@@ -110,6 +111,32 @@ router->group("/api/v1", { auth }, {}, [](gtvr::router::Router& r) {
 ```
 
 Use `req.setContext(std::make_shared<User>(...))` in a middleware and `req.getContext<User>()` in the handler to pass data along. A group can mix HTTP and WebSocket middleware: each route only runs the middleware of its own kind.
+
+`router->use(middleware)` adds a middleware for **every** HTTP request, run before route matching, so it also sees requests that end in 404 or 405 (logging, request IDs, rate limiting, CORS). Headers it sets stay on the final response.
+
+### CORS
+
+```cpp
+#include <cppgate/Middleware/Cors.h>
+
+gtvr::middleware::CorsOptions cors;
+cors.allowed_origins = { "https://app.example.com", "https://*.example.com", "http://localhost:3000" };
+cors.allow_credentials = true;      // cookies / Authorization
+router->use(gtvr::middleware::cors(cors));
+```
+
+Register it with `use()`: browsers send a preflight `OPTIONS` request first, and it must be answered whatever methods the route has. Preflights from allowed origins get `204` (handlers don't run), from other origins `403`. Other requests from an allowed origin get the CORS headers on their response, including errors, so the page can read them.
+
+| Option | Default | |
+|---|---|---|
+| `allowed_origins` | `{ "*" }` | exact origins, `https://*.example.com` for subdomains, or `*` |
+| `allowed_methods` | GET, HEAD, POST, PUT, PATCH, DELETE | |
+| `allowed_headers` | empty | request headers allowed; empty allows what the preflight asks for |
+| `exposed_headers` | empty | response headers JavaScript may read |
+| `allow_credentials` | `false` | with `*`, the request's origin is echoed (browsers refuse `*` with credentials) |
+| `max_age` | 600 s | how long browsers cache a preflight |
+
+CORS is enforced by browsers only. It is not access control: protect your routes anyway.
 
 ## WebSockets
 

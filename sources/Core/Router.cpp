@@ -164,6 +164,11 @@ namespace gtvr::router {
         method_not_allowed_handler = std::move(handler);
     }
 
+    void Router::use(HttpHandler middleware)
+    {
+        global_middlewares_.push_back(std::move(middleware));
+    }
+
     void Router::setTrustedProxies(const std::vector<std::string>& cidrs)
     {
         // Built completely before being published, a request never sees a half-filled list
@@ -263,6 +268,21 @@ namespace gtvr::router {
         bool path_matched = false;
 
         request.setIP(trustedProxies()->resolve(request.getPeerIP(), request.request));
+
+        for (const auto& middleware : global_middlewares_)
+        {
+            try {
+                middleware(request, response);
+            }
+            catch (...)
+            {
+                std::get<HttpHandler>(internal_server_error_handler)(request, response);        // 500
+                return;
+            }
+
+            if (response.hasResponse())
+                return;
+        }
 
         auto url = boost::urls::parse_uri_reference(request.target());
         

@@ -151,16 +151,6 @@ namespace gtvr {
             {
                 options_ = options;
             }
-
-            // Old names, kept so existing code compiles
-            template<uint8_t flags>
-            [[deprecated("use run()")]] void Run() { run<flags>(); }
-
-            [[deprecated("use setSSLContext()")]] void SetSSLContext(boost::asio::ssl::context* ctx) { setSSLContext(ctx); }
-
-            [[deprecated("use setRouter()")]] void SetRouter(std::shared_ptr<gtvr::router::Router> router) { setRouter(std::move(router)); }
-
-            [[deprecated("use setOptions()")]] void SetOptions(const ServerOptions& options) { setOptions(options); }
         
         private:
             template<uint8_t flags>

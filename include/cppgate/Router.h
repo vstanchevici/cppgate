@@ -229,9 +229,10 @@ namespace gtvr::router {
                 return result ? Queries(result->params()) : Queries({});
             }
 
+            // Empty outside of a matched route (e.g. in a Router::use() middleware)
             inline std::string_view urlParam(const std::string& key) const
             {
-                return params->get(key);
+                return params ? params->get(key) : std::string_view{};
             }
 
             inline auto target()
@@ -466,6 +467,7 @@ namespace gtvr::router {
             };
 
             std::vector<Route>                          routes_;
+            std::vector<HttpHandler>                    global_middlewares_;
 
             // Replaced as a whole by setTrustedProxies() while requests read it, so it is swapped atomically
             #ifdef __cpp_lib_atomic_shared_ptr
@@ -480,6 +482,11 @@ namespace gtvr::router {
             void setNotFoundHandler(Handler handler);
 
             void setMethodNotAllowedHandler(Handler handler);
+
+            // Middleware for every HTTP request, run before route matching (so also for 404/405), in
+            // the order added: CORS, logging... A middleware that responds ends the request there.
+            // Call during setup, before serving.
+            void use(HttpHandler middleware);
 
             // Proxies whose X-Forwarded-For / X-Real-IP headers are believed, e.g. { "127.0.0.1", "10.0.0.0/8" }.
             // Empty by default: the client IP is the socket address. Throws std::invalid_argument.

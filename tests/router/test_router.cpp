@@ -872,3 +872,75 @@ TEST_CASE("Long URLs and large parameter values", "[router][params][big]")
         CHECK(call(router, http::verb::post, "/upload", std::string(1024 * 1024, 'b')).body == "1048576");
     }
 }
+
+TEST_CASE("Router::use() middleware runs before route matching", "[router][middleware][use]")
+{
+    Router router;
+    std::string trace;
+
+    router.use([&](HttpRequest& req, HttpResponse&) {
+        trace += "g1";
+        CHECK(req.urlParam("id").empty());      // no route matched yet: empty, not a crash
+    });
+    router.use([&](HttpRequest&, HttpResponse& res) {
+        trace += "g2";
+        res.header("X-Request-Id", "42");
+    });
+    router.add({ http::verb::get }, "/users/{id}", [&](HttpRequest& req, HttpResponse& res) {
+        trace += "H";
+        res.sendContent(std::string(req.urlParam("id")));
+    });
+
+    SECTION("in order, then the route, and headers set before stay on the response")
+    {
+        http::request<http::string_body> beast_req{ http::verb::get, "/users/7", 11 };
+        HttpRequest req(beast_req);
+        HttpResponse res;
+        router.route(req, res);
+
+        CHECK(trace == "g1g2H");
+        CHECK(res.beast_res_.body() == "7");
+        CHECK(res.beast_res_["X-Request-Id"] == "42");
+    }
+
+    SECTION("also for 404 and 405")
+    {
+        CHECK(call(router, http::verb::get, "/nope").status == http::status::not_found);
+        CHECK(trace == "g1g2");
+
+        trace.clear();
+        CHECK(call(router, http::verb::delete_, "/users/7").status == http::status::method_not_allowed);
+        CHECK(trace == "g1g2");
+    }
+}
+
+TEST_CASE("A Router::use() middleware that responds ends the request", "[router][middleware][use]")
+{
+    Router router;
+    bool handler_called = false;
+
+    router.use([](HttpRequest& req, HttpResponse& res) {
+        if (req.headers().get("X-Blocked") == "yes")
+            res.send(http::status::too_many_requests, "slow down");
+    });
+    router.add({ http::verb::get }, "/x", [&](HttpRequest&, HttpResponse& res) { handler_called = true; res.sendContent("x"); });
+
+    http::request<http::string_body> beast_req{ http::verb::get, "/x", 11 };
+    beast_req.set("X-Blocked", "yes");
+    HttpRequest req(beast_req);
+    HttpResponse res;
+    router.route(req, res);
+
+    CHECK(res.beast_res_.result() == http::status::too_many_requests);
+    CHECK_FALSE(handler_called);
+    CHECK(call(router, http::verb::get, "/x").body == "x");
+}
+
+TEST_CASE("A Router::use() middleware that throws gives 500", "[router][middleware][use]")
+{
+    Router router;
+    router.use([](HttpRequest&, HttpResponse&) { throw std::runtime_error("boom"); });
+    router.add({ http::verb::get }, "/x", [](HttpRequest&, HttpResponse& res) { res.sendContent("x"); });
+
+    CHECK(call(router, http::verb::get, "/x").status == http::status::internal_server_error);
+}

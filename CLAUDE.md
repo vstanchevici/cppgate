@@ -20,7 +20,7 @@ Tests (Catch2 comes from the conanfile as a `test_requires`):
 ```sh
 cmake build/xcode -DBUILD_TESTING=ON
 cmake --build build/xcode --config Debug --target test_router
-./build/xcode/Debug/test_router            # also test_listener (real sockets), test_trusted_proxies, test_ring_buffer; or: ctest --test-dir build/xcode -C Debug
+./build/xcode/Debug/test_router            # also test_listener (real sockets), test_cors, test_trusted_proxies, test_ring_buffer; or: ctest --test-dir build/xcode -C Debug
 ```
 ThreadSanitizer build (Ninja, separate folder, reuses the Conan toolchain):
 ```sh
@@ -38,6 +38,7 @@ CMake options: `BUILD_TESTING` (OFF), `BUILD_EXAMPLES` (OFF; each `examples/*` d
 
 - `include/cppgate/` — public headers. Much of the logic is header-only templates (`Listener`, `HttpSession`, `WebSocketSession`). `RingBuffer.h` (lock-free MPMC queue) is currently unused, kept for later.
 - `sources/Core/` — `Router.cpp`, `Log.cpp`, `TrustedProxies.cpp`. The sessions and the Listener are header-only.
+- `include/cppgate/Middleware/` + `sources/Middleware/` — ready-made middlewares (`Cors.h`, namespace `gtvr::middleware`), each returning a `router::HttpHandler`.
 - CMake also globs `sources/{Authentication,Handlers}` and the matching include dirs; they don't exist yet but are where new modules are expected to go. New `.cpp`/`.h` files in these dirs are picked up automatically (`find_source_files` in `cmake/Tools.cmake`) — re-run CMake configure after adding files.
 - `tests/<name>/` — each subdir is its own CMake project using Catch2.
 
@@ -56,6 +57,7 @@ CMake options: `BUILD_TESTING` (OFF), `BUILD_EXAMPLES` (OFF; each `examples/*` d
   2. `Router::open()` runs after the handshake: the handler is the onOpen event, where `onMessage/onClose/onError` are set (`onMessage` gets a `WebSocketMessage`: `isText()`, `text()`, `bytes()`, a view valid only during the callback). Reading starts only after it returns.
   Callbacks receive `WebSocketContext&` so users never capture the `shared_ptr` (cycle). `onClose` fires exactly once (guarded in `emitClose`) and releases all callbacks.
 - Client IP: sessions only set the socket address (`HttpRequest::setPeerIP`, `WebSocketContext` ctor); the Router works it out per request with `TrustedProxies` (`Router::setTrustedProxies`, empty by default, safe to call while serving: the list is an immutable `shared_ptr` swapped atomically). `X-Forwarded-For` is read right to left and only from trusted peers, then `X-Real-IP`. `getIP()`/`ip()` = client, `getPeerIP()`/`peerIP()` = socket.
+- `Router::use()` adds global HTTP middlewares, run before route matching (also for 404/405); one that responds ends the request. CORS must go there, preflights would otherwise hit 405. `urlParam()` is empty in them (no route matched yet).
 - HTTP routing skips WebSocket routes and vice versa; routes only run middlewares of their own kind (`std::get_if`), so groups can mix both.
 - Logging: use the `slog_trace/debug/info/warn/error/critical` macros from `Log.h` (spdlog, fmt-style format strings).
 - Log level rule: anything a client can cause (bad/oversized requests, disconnects, timeouts) is `slog_debug`, never error, otherwise clients can flood the logs.
@@ -66,7 +68,7 @@ CMake options: `BUILD_TESTING` (OFF), `BUILD_EXAMPLES` (OFF; each `examples/*` d
 
 - 4-space indentation, `access:` labels indented inside classes, braces on their own line for functions/control flow.
 - Public classes are exported with `CPPGATE_API` (`cppgate.h`); it's defined empty for static builds.
-- Public methods are camelCase (`run`, `setRouter`, `sendJSON`). Old PascalCase Listener names (`Run`, `SetRouter`, `SetSSLContext`, `SetOptions`) remain as `[[deprecated]]` forwarders. Exception: `Logger::Init/Get`. Session internals follow Beast's snake_case (`do_read`, `on_write`).
+- Public methods are camelCase (`run`, `setRouter`, `sendJSON`), no deprecated aliases: the owner updates calling code directly. Exception: `Logger::Init/Get`. Session internals follow Beast's snake_case (`do_read`, `on_write`).
 - Members use a trailing underscore (`routes_`, `router_`).
 
 ## Testing notes
