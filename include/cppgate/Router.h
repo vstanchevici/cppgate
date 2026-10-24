@@ -54,7 +54,10 @@ namespace gtvr::router {
             void reset()
             {
                 params.clear();
-                resource.release();
+                
+                #ifdef HAVE_MEMORY_RESOURCE
+                    resource.release();
+                #endif
             }
 
             // Delete copy/move to prevent accidental misuse of the PMR resource
