@@ -1,1 +1,233 @@
 # cppgate
+
+A C++20 HTTP and WebSocket server library built on Boost.Beast and Boost.Asio: an Express-style router, WebSocket routes with middleware, TLS, and production basics (limits, client IP behind proxies, graceful shutdown).
+
+> **Status: early (v0.1.0).** The API may still change. Developed and tested on macOS (Apple Clang 14, Xcode 14). Linux and Windows have build scripts but have not been tested yet.
+
+## Features
+
+- **Router**: paths with parameters (`/users/{id}`, `/items/{id:\d+}`), method sets, groups with prefixes, pre/post middleware, custom 404/405 handlers, 500 on exceptions. Patterns use RE2, so a route can't trigger catastrophic regex backtracking.
+- **WebSocket routes** with the same router and middleware: the upgrade can be refused with a real HTTP status before the handshake, and callbacks (`onMessage`, `onClose`, `onError`) are set per connection.
+- **HTTP and HTTPS on one port** (TLS detected per connection), or HTTPS only. WSS works the same way.
+- **Limits and errors**: header/body limits with proper `400`/`413`/`414`/`431` responses, `Expect: 100-continue`, timeouts, slow WebSocket clients disconnected instead of buffering without limit.
+- **Client IP behind reverse proxies** (`X-Forwarded-For`, `X-Real-IP`), only trusted from proxies you declare.
+- **Graceful shutdown**: stop accepting, finish requests in progress, close WebSockets with 1001.
+
+## Requirements
+
+- C++20 compiler, CMake 3.20+, [Conan 2](https://conan.io)
+- Dependencies (installed by Conan): Boost 1.86, OpenSSL 3, RE2, spdlog. Catch2 for the tests.
+
+## Build
+
+```sh
+# 1. Dependencies (macOS; Linux: BuildLinux.sh, Windows: BuildVS2022.bat)
+cd conan && ./BuildMacOS.sh Debug && cd ..
+
+# 2. Configure and build, with tests and examples
+cmake -S . -G Xcode -B build/xcode \
+  -DCMAKE_TOOLCHAIN_FILE=build/xcode/generators/conan_toolchain.cmake \
+  -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DBUILD_TESTING=ON -DBUILD_EXAMPLES=ON
+cmake --build build/xcode --config Debug
+
+# 3. Run the tests and the example
+ctest --test-dir build/xcode -C Debug
+./build/xcode/Debug/echo_server 8080
+```
+
+CMake options: `BUILD_TESTING`, `BUILD_EXAMPLES` (both `OFF` by default), `BUILD_SHARED_LIBS` (static by default).
+
+## Quick start
+
+```cpp
+#include <cppgate/Listener.h>
+
+namespace http = boost::beast::http;
+using gtvr::router::HttpRequest;
+using gtvr::router::HttpResponse;
+
+int main()
+{
+    gtvr::Logger::Init();       // required before anything logs
+
+    boost::asio::io_context ioc;
+
+    auto router = std::make_shared<gtvr::router::Router>();
+
+    router->add({ http::verb::get }, "/hello", [](HttpRequest&, HttpResponse& res) {
+        res.send("hello", "text/plain");
+    });
+
+    router->add({ http::verb::get }, "/users/{id}", [](HttpRequest& req, HttpResponse& res) {
+        res.sendJSON(R"({"id": ")" + std::string(req.urlParam("id")) + R"("})");
+    });
+
+    auto listener = std::make_shared<gtvr::Listener>(ioc, boost::asio::ip::tcp::endpoint{ boost::asio::ip::make_address("0.0.0.0"), 8080 });
+    listener->setRouter(router);
+    listener->run<gtvr::Protocol::HTTP>();
+
+    ioc.run();
+}
+```
+
+The constructor throws `boost::system::system_error` if the address can't be used, for example when the port is already taken. [`examples/echo`](examples/echo/main.cpp) is a complete server with WebSockets, TLS, options and graceful shutdown.
+
+## Routing
+
+```cpp
+router->add({ http::verb::get, http::verb::head }, "/files/{name}", handler);    // several methods
+router->add({ http::verb::get }, R"(/items/{id:\d+})", handler);                 // custom pattern: /items/42, not /items/abc
+```
+
+In a handler:
+
+| | |
+|---|---|
+| `req.urlParam("id")` | path parameter (a view, valid during the handler) |
+| `req.urlQueries().get("q")` | query string value |
+| `req.formQueries().get("user")` | `application/x-www-form-urlencoded` body |
+| `req.headers().get(http::field::authorization)` | header |
+| `req.body()`, `req.method()`, `req.target()` | the rest of the request |
+| `req.getIP()` | client IP (see [Client IP](#client-ip-behind-a-proxy)) |
+| `res.send(status, body, content_type)`, `res.sendJSON(body)`, `res.sendNoContent()` | responses |
+
+- The first registered route that matches wins. A known path with the wrong method gets 405, an unknown path 404. Replace them with `setNotFoundHandler()` / `setMethodNotAllowedHandler()`.
+- A handler that throws, or returns without a response, produces 500.
+
+### Middleware and groups
+
+Middleware has the same signature as a handler. A **pre** middleware that sends a response stops the chain; a **post** middleware runs only if the handler didn't respond.
+
+```cpp
+gtvr::router::Handler auth = gtvr::router::HttpHandler([](HttpRequest& req, HttpResponse& res) {
+    if (req.headers().get(http::field::authorization) != "Bearer secret")
+        res.sendUnauthorized("login first");
+});
+
+router->group("/api/v1", { auth }, {}, [](gtvr::router::Router& r) {
+    r.add({ http::verb::get }, "/me", [](HttpRequest& req, HttpResponse& res) { /* ... */ });
+});
+```
+
+Use `req.setContext(std::make_shared<User>(...))` in a middleware and `req.getContext<User>()` in the handler to pass data along. A group can mix HTTP and WebSocket middleware: each route only runs the middleware of its own kind.
+
+## WebSockets
+
+A WebSocket route works in two steps:
+
+1. **Before the handshake**, the pre-middleware decides. Returning `false` refuses the upgrade with an HTTP response: 403 by default, or whatever you set with `reject()`.
+2. **After the handshake**, the handler runs. It is the `onOpen` event: set the callbacks there, or call `close()`.
+
+```cpp
+gtvr::router::Handler auth = gtvr::router::WebSocketHandler([](std::shared_ptr<gtvr::WebSocketContext> ws) {
+    gtvr::router::HttpRequest request(ws->request());
+    if (request.urlQueries().get("token") != "secret")
+    {
+        ws->reject(http::status::unauthorized, "bad token");
+        return false;
+    }
+    ws->setContext(std::make_shared<std::string>("alice"));     // per-connection data
+    return true;
+});
+
+router->add("/ws/rooms/{room}", { auth }, [](std::shared_ptr<gtvr::WebSocketContext> ws) {
+    ws->onMessage([](gtvr::WebSocketContext& ws, const gtvr::WebSocketMessage& msg) {
+        if (msg.isText())
+            ws.sendText(*ws.getContext<std::string>() + ": " + std::string(msg.text()));
+    });
+    ws->onClose([](gtvr::WebSocketContext& ws, gtvr::WebSocketContext::CloseCode code) { /* ... */ });
+    ws->onError([](gtvr::WebSocketContext& ws, boost::beast::error_code ec) { /* ... */ });
+    return true;
+});
+```
+
+Guarantees:
+
+- All callbacks of one connection run one at a time, never concurrently.
+- Messages are only read after the handler returns, so none arrive before `onMessage` is set.
+- `onClose` is called exactly once, however the connection ends (client, server, error).
+- `msg.text()` / `msg.bytes()` are only valid during the callback; copy what you keep.
+- `sendText()`, `sendBinary()`, `close()` and `pendingMessages()` are safe from any thread.
+
+Callbacks receive the context as a parameter: don't capture the `shared_ptr` in them, the connection owns its callbacks. Keep the `shared_ptr` elsewhere (e.g. a list of connections for broadcasting) and remove it in `onClose`.
+
+A client that reads slower than you send is disconnected with 1008 once `websocket_send_queue_limit` messages are waiting. Check `pendingMessages()` to skip slow clients, for example in a broadcast.
+
+## HTTPS and WSS
+
+```cpp
+#include <boost/asio/ssl.hpp>
+
+boost::asio::ssl::context ctx{ boost::asio::ssl::context::tls_server };   // must outlive the listener
+ctx.set_options(boost::asio::ssl::context::default_workarounds
+              | boost::asio::ssl::context::no_sslv2 | boost::asio::ssl::context::no_sslv3
+              | boost::asio::ssl::context::no_tlsv1 | boost::asio::ssl::context::no_tlsv1_1);
+ctx.use_certificate_chain_file("fullchain.pem");
+ctx.use_private_key_file("privkey.pem", boost::asio::ssl::context::pem);
+
+listener->setSSLContext(&ctx);
+listener->run<gtvr::Protocol::HTTP | gtvr::Protocol::HTTPS>();   // both on one port
+// listener->run<gtvr::Protocol::HTTPS>();                       // HTTPS only
+```
+
+WebSocket upgrades over HTTPS are WSS; nothing else to configure. `run()` throws `std::logic_error` if an HTTPS flag is set without a context. For a development certificate:
+
+```sh
+openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 365 -subj "/CN=localhost"
+```
+
+Alternatively, terminate TLS in nginx or Caddy and run cppgate with plain HTTP behind it (see the next section for client IPs).
+
+## Client IP behind a proxy
+
+Behind a reverse proxy, the socket peer is the proxy. Declare the proxies you trust:
+
+```cpp
+router->setTrustedProxies({ "127.0.0.1", "10.0.0.0/8" });
+```
+
+`req.getIP()` / `ws.ip()` then return the client from `X-Forwarded-For` (read right to left, skipping trusted proxies) or `X-Real-IP`. `getPeerIP()` / `peerIP()` always return the socket address. The headers are ignored when the request doesn't come from a trusted proxy, and the list is empty by default, so clients can't fake their IP. The list can be replaced while the server runs (e.g. to refresh CDN ranges).
+
+## Options
+
+```cpp
+gtvr::ServerOptions options;
+options.http_body_limit = 1024 * 1024;
+listener->setOptions(options);      // before run()
+```
+
+| Option | Default | |
+|---|---|---|
+| `http_header_limit` | 8 KB | request line + headers; over it: 414 or 431 |
+| `http_body_limit` | 10 000 bytes | over it: 413 |
+| `http_timeout` | 30 s | to read one request |
+| `http_linger_timeout` | 2 s | after an error response, drain the request so the client can read the response |
+| `websocket_message_limit` | 16 MB | largest message received |
+| `websocket_handshake_timeout` | 30 s | opening and closing handshakes |
+| `websocket_idle_timeout` | 300 s | close idle connections |
+| `websocket_keep_alive_pings` | `true` | ping idle clients |
+| `websocket_send_queue_limit` | 32 messages | past it, the client is closed with 1008 |
+
+The default body limit is small; raise it if your API receives larger JSON or uploads.
+
+## Graceful shutdown
+
+```cpp
+boost::asio::signal_set signals(ioc, SIGINT, SIGTERM);
+signals.async_wait([listener](const boost::system::error_code& ec, int) {
+    if (!ec)
+        listener->stop();
+});
+
+ioc.run();      // returns once the last connection is closed
+```
+
+`stop()` stops accepting, closes idle connections, lets requests in progress finish (with `Connection: close`) and closes WebSockets with 1001. A client that never answers the WebSocket close frame can delay it up to `websocket_handshake_timeout`; call `ioc.stop()` after your own deadline if you need a hard limit.
+
+## Logging
+
+cppgate logs through spdlog. Call `gtvr::Logger::Init()` once at startup, before creating a listener; the library doesn't initialize it for you. Problems a client can cause (bad requests, disconnects, timeouts) are logged at debug level, so clients can't flood your logs.
+
+## License
+
+[MIT](LICENSE)
