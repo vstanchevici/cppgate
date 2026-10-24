@@ -1,5 +1,7 @@
 #include <cppgate/Listener.h>
 
+#include <boost/asio/ssl.hpp>
+
 #include <cstdlib>
 #include <memory>
 #include <string>
@@ -9,8 +11,14 @@ namespace http = boost::beast::http;
 /*
     HTTP + WebSocket echo server.
 
+        echo_server [port] [cert.pem key.pem [tls-only]]
+
         curl http://127.0.0.1:8080/hello
         ws://127.0.0.1:8080/ws/echo/{room}?token=secret
+
+    With a certificate, HTTP and HTTPS (WS and WSS) on the same port, or HTTPS only with "tls-only".
+    Self-signed certificate for testing:
+        openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 365 -subj "/CN=localhost"
 */
 int main(int argc, char* argv[])
 {
@@ -72,9 +80,36 @@ int main(int argc, char* argv[])
     gtvr::ServerOptions options;
     options.http_body_limit = 64 * 1024;        // accept request bodies up to 64 KB
     listener->SetOptions(options);
-    listener->Run<gtvr::Protocol::HTTP | gtvr::Protocol::WS>();
+    // Must outlive the listener
+    boost::asio::ssl::context ssl_ctx{ boost::asio::ssl::context::tls_server };
 
-    slog_info("listening on 127.0.0.1:{}", port);
+    if (argc > 3)
+    {
+        ssl_ctx.set_options(boost::asio::ssl::context::default_workarounds
+                          | boost::asio::ssl::context::no_sslv2
+                          | boost::asio::ssl::context::no_sslv3
+                          | boost::asio::ssl::context::no_tlsv1
+                          | boost::asio::ssl::context::no_tlsv1_1);
+        ssl_ctx.use_certificate_chain_file(argv[2]);
+        ssl_ctx.use_private_key_file(argv[3], boost::asio::ssl::context::pem);
+        listener->SetSSLContext(&ssl_ctx);
+    }
+
+    if (argc > 4 && std::string(argv[4]) == "tls-only")
+    {
+        listener->Run<gtvr::Protocol::HTTPS | gtvr::Protocol::WSS>();
+        slog_info("listening on 127.0.0.1:{} (HTTPS/WSS only)", port);
+    }
+    else if (argc > 3)
+    {
+        listener->Run<gtvr::Protocol::HTTP | gtvr::Protocol::HTTPS | gtvr::Protocol::WS | gtvr::Protocol::WSS>();
+        slog_info("listening on 127.0.0.1:{} (HTTP/WS and HTTPS/WSS)", port);
+    }
+    else
+    {
+        listener->Run<gtvr::Protocol::HTTP | gtvr::Protocol::WS>();
+        slog_info("listening on 127.0.0.1:{} (HTTP/WS)", port);
+    }
 
     ioc.run();
 

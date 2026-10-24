@@ -132,7 +132,7 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
 
             if (ec)
             {
-                slog_error("{}", ec.message());
+                slog_debug("write: {}", ec.message());
                 do_eof(); // Clean up socket descriptors and self references safely
                 return;
             }
@@ -150,11 +150,15 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
 
 
     public:
-        explicit HttpSession(boost::asio::ip::tcp::socket&& socket, const ServerOptions& options): stream_(boost::beast::tcp_stream(std::move(socket))), options_(options)
+        // Starts plain, then detects TLS if with_ssl
+        explicit HttpSession(boost::asio::ip::tcp::socket&& socket, const ServerOptions& options) requires (with_plain)
+            : stream_(boost::beast::tcp_stream(std::move(socket))), options_(options)
         {
         }
         
-        explicit HttpSession(boost::asio::ip::tcp::socket&& socket, boost::asio::ssl::context* ctx, const ServerOptions& options): stream_(std::in_place_type<h_ssl_t>, std::move(socket), *ctx), options_(options)
+        // SSL only: TLS from the first byte
+        explicit HttpSession(boost::asio::ip::tcp::socket&& socket, boost::asio::ssl::context* ctx, const ServerOptions& options) requires (!with_plain)
+            : stream_(std::in_place_type<h_ssl_t>, std::move(socket), *ctx), options_(options)
         {
             
         }
@@ -184,6 +188,12 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
 
                     boost::beast::async_detect_ssl(hs, buffer_, boost::beast::bind_front_handler(&HttpSession::on_detect, this->shared_from_this(), ctx, std::move(router)));
                 }
+                else {
+                    // SSL only session: nothing to detect, handshake right away
+                    boost::beast::get_lowest_layer(hs).expires_after(options_.http_timeout);
+
+                    hs.async_handshake(boost::asio::ssl::stream_base::server, buffer_.data(), boost::beast::bind_front_handler(&HttpSession::on_handshake, this->shared_from_this(), std::move(router)));
+                }
             }, stream_);
         }
 
@@ -202,6 +212,11 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
                 if constexpr (with_ssl == true)
                 {
                     on_ssl_session(ctx, router);
+                }
+                else
+                {
+                    // TLS client on a plain listener: returning drops the last reference, the socket closes now
+                    slog_debug("detect: TLS client on a listener without HTTPS");
                 }
             }
             else
@@ -224,7 +239,8 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
         {
             if (ec)
             {
-                slog_error("{}", ec.message());
+                // Bad certificate, plain HTTP on a TLS port, scanners: the client's problem
+                slog_debug("handshake: {}", ec.message());
                 return;
             }
 
@@ -238,7 +254,8 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
         {
             if (ec)
             {
-                slog_error("{}", ec.message());
+                // Many clients close without a TLS close_notify (stream truncated): harmless
+                slog_debug("shutdown: {}", ec.message());
                 return;
             }
 
@@ -312,6 +329,11 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
                 
                 if constexpr (std::is_same_v<T, h_ssl_t>)
                 {
+                    // A TLS shutdown would stop reading what the client still sends: drain instead,
+                    // the response is already written
+                    if (linger_)
+                        return do_linger();
+
                     // Set the timeout.
                     boost::beast::get_lowest_layer(hs).expires_after(options_.http_timeout);
 
@@ -336,25 +358,21 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
         // response. So after it, keep reading and discarding until the client closes or the timeout.
         void do_linger()
         {
-            if constexpr (with_plain)
-            {
-                if (auto* hs = std::get_if<h_plain_t>(&stream_))
-                {
-                    linger_buffer_.resize(16 * 1024);
+            linger_buffer_.resize(16 * 1024);
 
-                    // One deadline for the whole drain
-                    hs->expires_after(options_.http_linger_timeout);
-                    read_linger();
-                }
-            }
+            // One deadline for the whole drain
+            std::visit([this](auto& hs) { boost::beast::get_lowest_layer(hs).expires_after(options_.http_linger_timeout); }, stream_);
+
+            read_linger();
         }
 
         void read_linger()
         {
-            if constexpr (with_plain)
+            // Over TLS this decrypts and discards, so the client keeps a working connection until we close
+            std::visit([this](auto& hs)
             {
-                std::get<h_plain_t>(stream_).async_read_some(boost::asio::buffer(linger_buffer_), boost::beast::bind_front_handler(&HttpSession::on_linger, shared_from_this()));
-            }
+                hs.async_read_some(boost::asio::buffer(linger_buffer_), boost::beast::bind_front_handler(&HttpSession::on_linger, shared_from_this()));
+            }, stream_);
         }
 
         void on_linger(boost::beast::error_code ec, std::size_t bytes_transferred)

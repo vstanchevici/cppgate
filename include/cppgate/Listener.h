@@ -4,6 +4,7 @@
 #include <boost/asio/strand.hpp>
 #include <cppgate/Router.h>
 #include <cppgate/ServerOptions.h>
+#include <stdexcept>
 #include "HttpSession.h"
 
 namespace gtvr {  
@@ -57,7 +58,7 @@ namespace gtvr {
     {
         private:
             boost::beast::net::io_context&          ioc_;
-            boost::asio::ssl::context*              ctx_;
+            boost::asio::ssl::context*              ctx_ = nullptr;
             boost::asio::ip::tcp::acceptor          acceptor_;
             std::shared_ptr<gtvr::router::Router>   router_;
             ServerOptions                           options_;
@@ -100,14 +101,24 @@ namespace gtvr {
                 }
             }
 
-            // Start accepting incoming connections
+            // Start accepting incoming connections.
+            // HTTP | HTTPS on the same port: each connection is checked for TLS. HTTPS alone: TLS only.
+            // WebSocket upgrades are accepted on any of them (WS over HTTP, WSS over HTTPS).
             template<uint8_t flags>
             void Run()
             {
                 static_assert(flags != 0, "Listener must support at least one protocol!");
+
+                if constexpr (has_flag<flags, Protocol::ANY_SSL>)
+                {
+                    if (ctx_ == nullptr)
+                        throw std::logic_error("Listener: HTTPS/WSS needs SetSSLContext() before Run()");
+                }
+
                 do_accept<flags>();
             }
 
+            // The context must outlive the Listener, only the pointer is kept
             void SetSSLContext(boost::asio::ssl::context* ctx)
             {
                 ctx_ = ctx;
@@ -145,11 +156,12 @@ namespace gtvr {
                     static constexpr bool support_ssl   = has_flag<flags, Protocol::ANY_SSL>;
                     static constexpr bool support_plain = has_flag<flags, Protocol::ANY_PLAIN>;
                     
-                    // Create the detector http_session and run it
-                    if constexpr ((support_ssl == false) && (support_plain == false))
-                        std::make_shared<HttpSession<support_plain, support_ssl>>(std::move(socket), ctx_, options_)->run(ctx_, router_);
-                    else
+                    // With plain support the session starts plain and detects TLS (when supported),
+                    // SSL only: TLS from the first byte
+                    if constexpr (support_plain)
                         std::make_shared<HttpSession<support_plain, support_ssl>>(std::move(socket), options_)->run(ctx_, router_);
+                    else
+                        std::make_shared<HttpSession<support_plain, support_ssl>>(std::move(socket), ctx_, options_)->run(ctx_, router_);
                 }
 
                 // Accept another connection

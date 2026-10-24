@@ -32,7 +32,7 @@ cmake --build build/tsan && ./build/tsan/test_router "[threads]"
 
 CMake options: `BUILD_TESTING` (OFF), `BUILD_EXAMPLES` (OFF; each `examples/*` dir is added), `BUILD_SHARED_LIBS`.
 
-`examples/echo` is an HTTP + WebSocket echo server (`./build/xcode/Debug/echo_server [port]`). The library build alone does not instantiate the session templates (`HttpSession`, `WebSocketSession`, `Listener::Run`), so build the example to check they compile.
+`examples/echo` is an HTTP + WebSocket echo server (`./build/xcode/Debug/echo_server [port] [cert.pem key.pem [tls-only]]`; with a certificate it serves HTTP+HTTPS on one port, or HTTPS only). The library build alone does not instantiate the session templates (`HttpSession`, `WebSocketSession`, `Listener::Run`), so build the example to check they compile.
 
 ## Layout
 
@@ -45,6 +45,8 @@ CMake options: `BUILD_TESTING` (OFF), `BUILD_EXAMPLES` (OFF; each `examples/*` d
 ## Architecture
 
 - `Listener` accepts TCP connections; `Run<flags>()` takes a `Protocol` bitmask (`HTTP | HTTPS | WS | WSS`) resolved at compile time, and spawns `HttpSession<plain, ssl>` per connection on its own strand.
+  - With plain support the session starts plain and `async_detect_ssl` switches to TLS when HTTPS is enabled (HTTP and HTTPS on one port); HTTPS alone does the handshake from the first byte. A TLS client on a plain-only listener is closed at once.
+  - Any SSL flag needs `SetSSLContext()` before `Run()` (throws `std::logic_error` otherwise); the context must outlive the Listener. The WS/WSS flags change nothing today: upgrades are accepted on any listener.
 - `Router` matches routes by regex (RE2) built from paths like `/users/{id}`; supports method sets, groups with prefixes, and pre/post middlewares. A `Handler` is `std::variant<HttpHandler, WebSocketHandler>`.
 - `RouteParams` lives on the stack of `Router::route()`: a fixed array of 8 `string_view` pairs, heap only beyond that. Values are views into the request path — don't outlive the request. `Router::initialize()` is a deprecated no-op.
 - `HttpRequest`/`HttpResponse` are thin wrappers over Beast's `request/response<string_body>`.
@@ -56,7 +58,7 @@ CMake options: `BUILD_TESTING` (OFF), `BUILD_EXAMPLES` (OFF; each `examples/*` d
 - HTTP routing skips WebSocket routes and vice versa; routes only run middlewares of their own kind (`std::get_if`), so groups can mix both.
 - Logging: use the `slog_trace/debug/info/warn/error/critical` macros from `Log.h` (spdlog, fmt-style format strings).
 - Log level rule: anything a client can cause (bad/oversized requests, disconnects, timeouts) is `slog_debug`, never error, otherwise clients can flood the logs.
-- `ServerOptions` (`Listener::SetOptions`, before `Run`) holds the HTTP header/body limits, timeouts and WebSocket limits; sessions keep a copy. Parser errors get a real response (400, 413 body, 414 URL, 431 headers) with `Connection: close`, then a lingering close (`http_linger_timeout`) that drains the rest of the request so the client reads the response instead of a reset.
+- `ServerOptions` (`Listener::SetOptions`, before `Run`) holds the HTTP header/body limits, timeouts and WebSocket limits; sessions keep a copy. Parser errors get a real response (400, 413 body, 414 URL, 431 headers) with `Connection: close`, then a lingering close (`http_linger_timeout`) that drains the rest of the request so the client reads the response instead of a reset (plain and TLS; over TLS it drains instead of sending close_notify).
 
 ## Conventions
 

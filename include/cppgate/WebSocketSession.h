@@ -94,7 +94,7 @@ class WebSocketSession: public WebSocketContext, public std::enable_shared_from_
             boost::ignore_unused(bytes_transferred);
 
             if (ec)
-                slog_error("reject: {}", ec.message());
+                slog_debug("reject: {}", ec.message());
 
             std::visit([this](auto& ws)
             {
@@ -160,7 +160,7 @@ class WebSocketSession: public WebSocketContext, public std::enable_shared_from_
         {
             if (ec)
             {
-                slog_error("{}", ec.message());
+                slog_debug("accept: {}", ec.message());
                 return;
             }
 
@@ -239,7 +239,7 @@ class WebSocketSession: public WebSocketContext, public std::enable_shared_from_
             {
                 // The read loop reports the failure to the user
                 if (ec != boost::beast::net::error::operation_aborted)
-                    slog_error("write: {}", ec.message());
+                    slog_debug("write: {}", ec.message());
 
                 write_queue_.clear();
                 return;
@@ -256,7 +256,7 @@ class WebSocketSession: public WebSocketContext, public std::enable_shared_from_
             {
                 // This is common if the TCP connection dropped
                 // before the WebSocket close handshake finished.
-                slog_error("close: {}", ec.message());
+                slog_debug("close: {}", ec.message());
             }
 
             // Usually the read loop already reported it, emitClose ignores the second call
