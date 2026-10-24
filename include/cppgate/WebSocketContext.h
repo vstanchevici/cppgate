@@ -145,6 +145,11 @@ namespace gtvr {
 
             virtual void close(CloseCode code = CloseCode::normal) = 0;
 
+            // Messages sent but not written to the socket yet, from any thread. Useful to skip a slow
+            // client, e.g. in a broadcast. Past ServerOptions::websocket_send_queue_limit the client is
+            // disconnected with 1008 (policy violation).
+            virtual std::size_t pendingMessages() const = 0;
+
         protected:
             // Called by the session, on its strand
             void emitMessage(std::string_view data, bool is_text)

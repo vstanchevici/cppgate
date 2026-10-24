@@ -5,7 +5,9 @@
 #include <cppgate/Log.h>
 #include <cppgate/Router.h>
 #include <cppgate/ServerOptions.h>
+#include <cppgate/Connections.h>
 #include <cppgate/WebSocketContext.h>
+#include <atomic>
 #include <functional>
 #include <deque>
 
@@ -28,7 +30,7 @@ using ws_stream_t = std::conditional_t<
 >;
 
 template<bool with_plain, bool with_ssl>
-class WebSocketSession: public WebSocketContext, public std::enable_shared_from_this<WebSocketSession<with_plain, with_ssl>>
+class WebSocketSession: public WebSocketContext, public Connection, public std::enable_shared_from_this<WebSocketSession<with_plain, with_ssl>>
 {
     static_assert(with_plain || with_ssl, "WebSocketSession must have or plain or ssl stream.");
 
@@ -44,14 +46,17 @@ class WebSocketSession: public WebSocketContext, public std::enable_shared_from_
     };
 
     private:
-        static constexpr std::size_t                                    queue_limit = 32; // max write
         std::deque<ws_message>                                          write_queue_;
+
+        // Sent but not written yet, counted from the send*() call so any thread can read it
+        std::atomic<std::size_t>                                        pending_{ 0 };
 
         boost::beast::flat_buffer                                       buffer_;
         Request                                                         request_;
         boost::beast::http::response<boost::beast::http::string_body>   reject_response_;
         ws_stream_t<with_plain, with_ssl>                               stream_;
         ServerOptions                                                   options_;
+        std::shared_ptr<Connections>                                    connections_;
         bool                                                            closing_ = false;
 
         // Runs a user callback, an exception must not escape into the io_context
@@ -120,17 +125,6 @@ class WebSocketSession: public WebSocketContext, public std::enable_shared_from_
 
         void do_accept(std::shared_ptr<gtvr::router::Router> router)
         {
-            /*
-             std::visit([this](auto& ws) {
-                 ws.control_callback(
-                     [this](beast::websocket::frame_type kind, beast::string_view payload) {
-                         if(kind == beast::websocket::frame_type::pong) {
-                             // The client is alive! You could update a "last_seen" timestamp here
-                         }
-                     });
-             }, stream_);
-             */
-
             boost::beast::websocket::stream_base::timeout opt;
             opt.handshake_timeout = options_.websocket_handshake_timeout;   // also used for the close handshake
             opt.idle_timeout = options_.websocket_idle_timeout;
@@ -161,6 +155,14 @@ class WebSocketSession: public WebSocketContext, public std::enable_shared_from_
             if (ec)
             {
                 slog_debug("accept: {}", ec.message());
+                return;
+            }
+
+            // The Listener started stopping during the handshake: don't open, say goodbye
+            if (connections_ && connections_->stopping())
+            {
+                close(CloseCode::going_away);
+                do_read();
                 return;
             }
 
@@ -241,11 +243,13 @@ class WebSocketSession: public WebSocketContext, public std::enable_shared_from_
                 if (ec != boost::beast::net::error::operation_aborted)
                     slog_debug("write: {}", ec.message());
 
+                pending_ -= write_queue_.size();
                 write_queue_.clear();
                 return;
             }
 
             write_queue_.pop_front();
+            --pending_;
 
             do_write();
         }
@@ -270,15 +274,24 @@ class WebSocketSession: public WebSocketContext, public std::enable_shared_from_
 
         void send_internal(std::shared_ptr<const std::string> msg, bool is_text)
         {
+            ++pending_;
+
             // We must move to the strand to protect the queue
             boost::beast::net::post(get_strand(), [this, self = shared_from_this(), msg = std::move(msg), is_text]() mutable {
 
                 if (closing_)
+                {
+                    --pending_;
                     return;
+                }
 
-                // Check for "Slow Consumer" backpressure
-                if (write_queue_.size() > queue_limit) {
-                    // Optional: Close connection or drop message
+                // Slow consumer: it doesn't read as fast as we send. Waiting would grow memory without
+                // limit and silently dropping would corrupt what the application thinks was delivered.
+                if (write_queue_.size() >= options_.websocket_send_queue_limit)
+                {
+                    --pending_;
+                    slog_debug("websocket {}: send queue full ({} messages), closing", ip(), write_queue_.size());
+                    close(CloseCode::policy_error);
                     return;
                 }
 
@@ -294,23 +307,39 @@ class WebSocketSession: public WebSocketContext, public std::enable_shared_from_
 
     public:
 
-        WebSocketSession(boost::beast::tcp_stream stream, Request request, std::string peer_ip, const ServerOptions& options) requires (with_plain)
-            : WebSocketContext(std::move(peer_ip)), request_(std::move(request)), stream_(ws_plain_t(std::move(stream))), options_(options)
+        WebSocketSession(boost::beast::tcp_stream stream, Request request, std::string peer_ip, const ServerOptions& options, std::shared_ptr<Connections> connections = {}) requires (with_plain)
+            : WebSocketContext(std::move(peer_ip)), request_(std::move(request)), stream_(ws_plain_t(std::move(stream))), options_(options), connections_(std::move(connections))
         {
         }
 
-        WebSocketSession(boost::beast::ssl_stream<boost::beast::tcp_stream> stream, Request request, std::string peer_ip, const ServerOptions& options) requires (with_ssl)
-            : WebSocketContext(std::move(peer_ip)), request_(std::move(request)), stream_(ws_ssl_t(std::move(stream))), options_(options)
+        WebSocketSession(boost::beast::ssl_stream<boost::beast::tcp_stream> stream, Request request, std::string peer_ip, const ServerOptions& options, std::shared_ptr<Connections> connections = {}) requires (with_ssl)
+            : WebSocketContext(std::move(peer_ip)), request_(std::move(request)), stream_(ws_ssl_t(std::move(stream))), options_(options), connections_(std::move(connections))
         {
         }
 
         // Must be called on the connection's strand
+        ~WebSocketSession()
+        {
+            if (connections_)
+                connections_->remove(this);
+        }
+
+        // Graceful shutdown, from any thread: close with 1001 (going away)
+        void stop() override
+        {
+            close(CloseCode::going_away);
+        }
+
         void run(std::shared_ptr<gtvr::router::Router> router)
         {
             gtvr::router::HttpResponse response;
 
-            // Same as HttpSession: result 0 means "no response yet"
-            response.beast_res_.result(0);
+            // Upgrade requested while the Listener is stopping
+            if (connections_ && !connections_->add(shared_from_this()))
+            {
+                response.send(boost::beast::http::status::service_unavailable, "Server is shutting down");
+                return do_reject(std::move(response));
+            }
 
             if (router->upgrade(shared_from_this(), response))
                 do_accept(router);
@@ -350,6 +379,11 @@ class WebSocketSession: public WebSocketContext, public std::enable_shared_from_
         void sendBinary(std::vector<uint8_t> data) override
         {
             send_internal(std::make_shared<std::string>(data.begin(), data.end()), false);
+        }
+
+        std::size_t pendingMessages() const override
+        {
+            return pending_;
         }
 };
 

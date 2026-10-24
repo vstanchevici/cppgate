@@ -34,8 +34,6 @@ namespace {
 
         HttpRequest request(beast_req);
         HttpResponse response;
-        // Same as HttpSession: result 0 means "no response yet"
-        response.beast_res_.result(0);
         router.route(request, response);
 
         return { response.beast_res_.result(), response.beast_res_.body(), std::string(response.beast_res_[http::field::content_type]) };
@@ -48,7 +46,6 @@ namespace {
         HttpRequest req(beast_req);
         req.setPeerIP(peer);
         HttpResponse res;
-        res.beast_res_.result(0);
         router.route(req, res);
         return res.beast_res_.body();
     }
@@ -66,6 +63,7 @@ namespace {
         void sendText(std::shared_ptr<const std::string> data) override { sent.push_back(*data); }
         void sendBinary(std::vector<uint8_t> data) override { sent.emplace_back(data.begin(), data.end()); }
         void close(CloseCode code) override { closed.push_back(code); }
+        std::size_t pendingMessages() const override { return 0; }
 
         // What the real session does on its strand
         using WebSocketContext::emitMessage;
@@ -83,11 +81,19 @@ namespace {
     UpgradeResult upgrade(Router& router, std::shared_ptr<FakeWebSocket> ws)
     {
         HttpResponse response;
-        response.beast_res_.result(0);
         bool accepted = router.upgrade(ws, response);
         return { accepted, response.beast_res_.result(), response.beast_res_.body() };
     }
 
+}
+
+TEST_CASE("A new HttpResponse has no response yet", "[router]")
+{
+    HttpResponse response;
+    CHECK_FALSE(response.hasResponse());
+
+    response.sendNoContent();
+    CHECK(response.hasResponse());
 }
 
 TEST_CASE("Static route returns handler response", "[router]")
@@ -302,7 +308,6 @@ TEST_CASE("Pre middleware", "[router][middleware]")
         beast_req.set(http::field::authorization, "secret");
         HttpRequest req(beast_req);
         HttpResponse res;
-        res.beast_res_.result(0);
         router.route(req, res);
 
         CHECK(res.beast_res_.result() == http::status::ok);
@@ -717,7 +722,6 @@ TEST_CASE("Router works out the HTTP client IP through trusted proxies", "[route
         HttpRequest req(beast_req);
         req.setPeerIP(peer);
         HttpResponse res;
-        res.beast_res_.result(0);
         router.route(req, res);
         return res.beast_res_.body();
     };

@@ -56,7 +56,7 @@ namespace gtvr::router {
         pattern = std::make_unique<RE2>(regex_pattern);
     }
 
-    bool Router::Route::PathMatch(std::string_view input, RouteParams& params) const
+    bool Router::Route::pathMatch(std::string_view input, RouteParams& params) const
     {      
         // We need N + 1 slots: index 0 is the full match, 1..N are our parameters
         int num_params = static_cast<int>(param_names.size());
@@ -79,7 +79,6 @@ namespace gtvr::router {
             for (int i = 0; i < num_params; ++i) {
                 // captures[0] is the whole string, so we start at index 1
                 params.add(param_names[i], captures[i + 1]);
-                //slog_info("name: {0}, key:{1}", param_names[i], captures[i + 1]);
             }
             return true;
         }
@@ -87,7 +86,7 @@ namespace gtvr::router {
         return false;
     }
 
-    bool Router::Route::MethodMatch(boost::beast::http::verb method) const
+    bool Router::Route::methodMatch(boost::beast::http::verb method) const
     {
         return methods.count(method);
     }
@@ -282,11 +281,11 @@ namespace gtvr::router {
                     if (route.isWebSocket())
                         continue;
 
-                    if (route.PathMatch(path, *request.params))
+                    if (route.pathMatch(path, *request.params))
                     {
                         path_matched = true;
 
-                        if (route.MethodMatch(request.method()))
+                        if (route.methodMatch(request.method()))
                         {
                             bool internal_server_error = false;
 
@@ -349,7 +348,7 @@ namespace gtvr::router {
         {
             const auto& route = routes_[i];
 
-            if (!route.isWebSocket() || !route.PathMatch(path, params))
+            if (!route.isWebSocket() || !route.pathMatch(path, params))
                 continue;
 
             // The connection outlives the request, so it keeps its own copy of the params

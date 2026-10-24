@@ -229,39 +229,6 @@ namespace gtvr::router {
                 return result ? Queries(result->params()) : Queries({});
             }
 
-            template<bool with_attributes = false>
-            void parseHeader(boost::beast::http::field header)
-            {
-                auto it = request.find(header);
-                if (it != request.end())
-                {
-                    if constexpr (with_attributes)
-                    {
-                        boost::beast::http::ext_list list{ it->value() };
-
-                        for (auto const& param : list) {
-                            // param.first is the encoding (e.g., "gzip")
-                            // param.second is the list of attributes (e.g., "q=0.8")
-                            //std::cout << "Encoding: " << param.first << "\n";
-                            for (auto const& attr : param.second) {
-                                //std::cout << "  Attr: " << attr.first << " = " << attr.second << "\n";
-                            }
-                        }
-                    }
-                    else
-                    {
-                        // token_list parses the "gzip, deflate, br" string into iterable tokens
-                        boost::beast::http::token_list tokens{ it->value() };
-
-                        for (auto const& token : tokens) {
-                            if (token == "gzip") {
-                                // Setup compression...
-                            }
-                        }
-                    }
-                }
-            }
-
             inline std::string_view urlParam(const std::string& key) const
             {
                 return params->get(key);
@@ -296,7 +263,13 @@ namespace gtvr::router {
     struct HttpResponse
     {
         public:
-            boost::beast::http::response<boost::beast::http::string_body> beast_res_;;                    
+            boost::beast::http::response<boost::beast::http::string_body> beast_res_;
+
+            // Beast starts a response at 200 OK; status 0 means "nobody answered yet" (see hasResponse)
+            HttpResponse()
+            {
+                beast_res_.result(0);
+            }
 
             inline bool keepAlive()
             {
@@ -464,9 +437,9 @@ namespace gtvr::router {
                 public:
                     Route(std::set<boost::beast::http::verb> methods, const std::string& path, const std::vector<Handler>& pre_middlewares, Handler handler, const std::vector<Handler>& post_middlewares);
 
-                    bool PathMatch(std::string_view input, RouteParams& params) const;
+                    bool pathMatch(std::string_view input, RouteParams& params) const;
                     
-                    bool MethodMatch(boost::beast::http::verb method) const;
+                    bool methodMatch(boost::beast::http::verb method) const;
 
                     bool isWebSocket() const;
 
@@ -489,7 +462,7 @@ namespace gtvr::router {
             };
 
             Handler internal_server_error_handler = [](HttpRequest& request, HttpResponse& response) {
-                response.send(boost::beast::http::status::internal_server_error, "Internal Server Errord");
+                response.send(boost::beast::http::status::internal_server_error, "Internal Server Error");
             };
 
             std::vector<Route>                          routes_;

@@ -36,6 +36,10 @@ namespace gtvr {
         std::chrono::seconds        websocket_idle_timeout      { 300 };
 
         bool                        websocket_keep_alive_pings  = true;
+
+        // Messages waiting to be sent to one client. A client that can't keep up past this is
+        // disconnected with 1008 (policy violation) instead of growing memory without limit.
+        std::size_t                 websocket_send_queue_limit  = 32;
     };
 
 }//namespace gtvr

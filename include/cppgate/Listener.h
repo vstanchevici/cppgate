@@ -1,9 +1,13 @@
 #pragma once
 
 #include <boost/asio/dispatch.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/strand.hpp>
+#include <boost/system/system_error.hpp>
 #include <cppgate/Router.h>
 #include <cppgate/ServerOptions.h>
+#include <cppgate/Connections.h>
+#include <chrono>
 #include <stdexcept>
 #include "HttpSession.h"
 
@@ -47,12 +51,6 @@ namespace gtvr {
     template<uint8_t flags, uint8_t mask>
     static constexpr bool has_flag = (flags & mask) != 0;
 
-    /*
-        static constexpr bool support_ssl   = has_flag<Flags, ANY_SSL>;
-        static constexpr bool support_plain = has_flag<Flags, ANY_PLAIN>;
-        static constexpr bool is_websocket  = has_flag<Flags, ANY_WS>;
-     */
-
     // Accepts incoming connections and launches the sessions    
     class Listener : public std::enable_shared_from_this<Listener>
     {
@@ -60,80 +58,109 @@ namespace gtvr {
             boost::beast::net::io_context&          ioc_;
             boost::asio::ssl::context*              ctx_ = nullptr;
             boost::asio::ip::tcp::acceptor          acceptor_;
+            boost::asio::steady_timer               accept_retry_timer_;
             std::shared_ptr<gtvr::router::Router>   router_;
             ServerOptions                           options_;
+            std::shared_ptr<Connections>            connections_ = std::make_shared<Connections>();
 
         public:
-            Listener(boost::beast::net::io_context& ioc, boost::asio::ip::tcp::endpoint endpoint): ioc_(ioc), acceptor_(boost::beast::net::make_strand(ioc))
+            // Throws boost::system::system_error when the address can't be used (e.g. port already in use)
+            Listener(boost::beast::net::io_context& ioc, boost::asio::ip::tcp::endpoint endpoint): ioc_(ioc), acceptor_(boost::beast::net::make_strand(ioc)), accept_retry_timer_(acceptor_.get_executor())
             {
                 boost::beast::error_code ec;
 
                 // Open the acceptor
                 acceptor_.open(endpoint.protocol(), ec);
                 if(ec)
-                {
-                    slog_error("open: {}", ec.message());
-                    return;
-                }
+                    throw boost::system::system_error(ec, "Listener: open");
 
                 // Allow address reuse
                 acceptor_.set_option(boost::beast::net::socket_base::reuse_address(true), ec);
                 if(ec)
-                {
-                    slog_error("set_option: {}", ec.message());
-                    return;
-                }
+                    throw boost::system::system_error(ec, "Listener: set_option");
 
                 // Bind to the server address
                 acceptor_.bind(endpoint, ec);
                 if(ec)
-                {
-                    slog_error("bind: {}", ec.message());
-                    return;
-                }
+                    throw boost::system::system_error(ec, "Listener: bind " + endpoint.address().to_string() + ":" + std::to_string(endpoint.port()));
 
                 // Start listening for connections
                 acceptor_.listen(boost::beast::net::socket_base::max_listen_connections, ec);
                 if(ec)
-                {
-                    slog_error("listen: {}", ec.message());
-                    return;
-                }
+                    throw boost::system::system_error(ec, "Listener: listen");
             }
 
             // Start accepting incoming connections.
             // HTTP | HTTPS on the same port: each connection is checked for TLS. HTTPS alone: TLS only.
             // WebSocket upgrades are accepted on any of them (WS over HTTP, WSS over HTTPS).
             template<uint8_t flags>
-            void Run()
+            void run()
             {
                 static_assert(flags != 0, "Listener must support at least one protocol!");
 
                 if constexpr (has_flag<flags, Protocol::ANY_SSL>)
                 {
                     if (ctx_ == nullptr)
-                        throw std::logic_error("Listener: HTTPS/WSS needs SetSSLContext() before Run()");
+                        throw std::logic_error("Listener: HTTPS/WSS needs setSSLContext() before run()");
                 }
 
                 do_accept<flags>();
             }
 
+            // Graceful shutdown, from any thread (e.g. a boost::asio::signal_set handler):
+            // stops accepting, closes idle connections, lets requests in progress finish (with
+            // Connection: close) and closes WebSockets with 1001. io_context::run() returns once
+            // every connection is gone, unless something else keeps it busy.
+            void stop()
+            {
+                boost::beast::net::post(acceptor_.get_executor(), [self = shared_from_this()]() {
+                    boost::beast::error_code ec;
+                    self->accept_retry_timer_.cancel();
+                    self->acceptor_.close(ec);
+                });
+
+                connections_->stopAll();
+            }
+
+            // The bound address, useful with port 0 (any free port)
+            boost::asio::ip::tcp::endpoint localEndpoint() const
+            {
+                boost::beast::error_code ec;
+                return acceptor_.local_endpoint(ec);
+            }
+
+            // Live connections (HTTP and WebSocket)
+            std::size_t connectionCount() const
+            {
+                return connections_->size();
+            }
+
             // The context must outlive the Listener, only the pointer is kept
-            void SetSSLContext(boost::asio::ssl::context* ctx)
+            void setSSLContext(boost::asio::ssl::context* ctx)
             {
                 ctx_ = ctx;
             }
 
-            void SetRouter(std::shared_ptr<gtvr::router::Router> router)
+            void setRouter(std::shared_ptr<gtvr::router::Router> router)
             {
                 router_ = router;
             }
 
-            // Limits and timeouts, call before Run()
-            void SetOptions(const ServerOptions& options)
+            // Limits and timeouts, call before run()
+            void setOptions(const ServerOptions& options)
             {
                 options_ = options;
             }
+
+            // Old names, kept so existing code compiles
+            template<uint8_t flags>
+            [[deprecated("use run()")]] void Run() { run<flags>(); }
+
+            [[deprecated("use setSSLContext()")]] void SetSSLContext(boost::asio::ssl::context* ctx) { setSSLContext(ctx); }
+
+            [[deprecated("use setRouter()")]] void SetRouter(std::shared_ptr<gtvr::router::Router> router) { setRouter(std::move(router)); }
+
+            [[deprecated("use setOptions()")]] void SetOptions(const ServerOptions& options) { setOptions(options); }
         
         private:
             template<uint8_t flags>
@@ -146,23 +173,40 @@ namespace gtvr {
             template<uint8_t flags>
             void on_accept(boost::beast::error_code ec, boost::asio::ip::tcp::socket socket)
             {
+                // stop() closed the acceptor
+                if (ec == boost::asio::error::operation_aborted || !acceptor_.is_open())
+                    return;
+
                 if(ec)
                 {
-                    slog_error("{}", ec.message());
+                    // The client gave up before we accepted it: nothing wrong on our side
+                    if (ec == boost::asio::error::connection_aborted || ec == boost::asio::error::connection_reset)
+                    {
+                        slog_debug("accept: {}", ec.message());
+                        return do_accept<flags>();
+                    }
+
+                    // Out of file descriptors or memory: keep the listener alive, but give the
+                    // server a moment to release resources instead of failing in a busy loop
+                    slog_error("accept: {} (retrying in 100 ms)", ec.message());
+
+                    accept_retry_timer_.expires_after(std::chrono::milliseconds(100));
+                    accept_retry_timer_.async_wait([self = shared_from_this()](boost::beast::error_code wait_ec) {
+                        if (!wait_ec && self->acceptor_.is_open())
+                            self->do_accept<flags>();
+                    });
                     return;
                 }
+
+                static constexpr bool support_ssl   = has_flag<flags, Protocol::ANY_SSL>;
+                static constexpr bool support_plain = has_flag<flags, Protocol::ANY_PLAIN>;
+                
+                // With plain support the session starts plain and detects TLS (when supported),
+                // SSL only: TLS from the first byte
+                if constexpr (support_plain)
+                    std::make_shared<HttpSession<support_plain, support_ssl>>(std::move(socket), options_, connections_)->run(ctx_, router_);
                 else
-                {
-                    static constexpr bool support_ssl   = has_flag<flags, Protocol::ANY_SSL>;
-                    static constexpr bool support_plain = has_flag<flags, Protocol::ANY_PLAIN>;
-                    
-                    // With plain support the session starts plain and detects TLS (when supported),
-                    // SSL only: TLS from the first byte
-                    if constexpr (support_plain)
-                        std::make_shared<HttpSession<support_plain, support_ssl>>(std::move(socket), options_)->run(ctx_, router_);
-                    else
-                        std::make_shared<HttpSession<support_plain, support_ssl>>(std::move(socket), ctx_, options_)->run(ctx_, router_);
-                }
+                    std::make_shared<HttpSession<support_plain, support_ssl>>(std::move(socket), ctx_, options_, connections_)->run(ctx_, router_);
 
                 // Accept another connection
                 do_accept<flags>();

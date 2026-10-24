@@ -1,5 +1,6 @@
 #include <cppgate/Listener.h>
 
+#include <boost/asio/signal_set.hpp>
 #include <boost/asio/ssl.hpp>
 
 #include <cstdlib>
@@ -74,12 +75,19 @@ int main(int argc, char* argv[])
         return true;
     });
 
-    auto listener = std::make_shared<gtvr::Listener>(ioc, boost::asio::ip::tcp::endpoint{ boost::asio::ip::make_address("127.0.0.1"), port });
-    listener->SetRouter(router);
+    std::shared_ptr<gtvr::Listener> listener;
+    try {
+        listener = std::make_shared<gtvr::Listener>(ioc, boost::asio::ip::tcp::endpoint{ boost::asio::ip::make_address("127.0.0.1"), port });
+    }
+    catch (const boost::system::system_error& e) {
+        slog_critical("{}", e.what());     // e.g. port already in use
+        return 1;
+    }
+    listener->setRouter(router);
 
     gtvr::ServerOptions options;
     options.http_body_limit = 64 * 1024;        // accept request bodies up to 64 KB
-    listener->SetOptions(options);
+    listener->setOptions(options);
     // Must outlive the listener
     boost::asio::ssl::context ssl_ctx{ boost::asio::ssl::context::tls_server };
 
@@ -92,26 +100,37 @@ int main(int argc, char* argv[])
                           | boost::asio::ssl::context::no_tlsv1_1);
         ssl_ctx.use_certificate_chain_file(argv[2]);
         ssl_ctx.use_private_key_file(argv[3], boost::asio::ssl::context::pem);
-        listener->SetSSLContext(&ssl_ctx);
+        listener->setSSLContext(&ssl_ctx);
     }
 
     if (argc > 4 && std::string(argv[4]) == "tls-only")
     {
-        listener->Run<gtvr::Protocol::HTTPS | gtvr::Protocol::WSS>();
+        listener->run<gtvr::Protocol::HTTPS | gtvr::Protocol::WSS>();
         slog_info("listening on 127.0.0.1:{} (HTTPS/WSS only)", port);
     }
     else if (argc > 3)
     {
-        listener->Run<gtvr::Protocol::HTTP | gtvr::Protocol::HTTPS | gtvr::Protocol::WS | gtvr::Protocol::WSS>();
+        listener->run<gtvr::Protocol::HTTP | gtvr::Protocol::HTTPS | gtvr::Protocol::WS | gtvr::Protocol::WSS>();
         slog_info("listening on 127.0.0.1:{} (HTTP/WS and HTTPS/WSS)", port);
     }
     else
     {
-        listener->Run<gtvr::Protocol::HTTP | gtvr::Protocol::WS>();
+        listener->run<gtvr::Protocol::HTTP | gtvr::Protocol::WS>();
         slog_info("listening on 127.0.0.1:{} (HTTP/WS)", port);
     }
 
+    // Ctrl+C / SIGTERM: graceful shutdown, ioc.run() returns when the last connection is closed
+    boost::asio::signal_set signals(ioc, SIGINT, SIGTERM);
+    signals.async_wait([listener](const boost::system::error_code& ec, int signal) {
+        if (ec)
+            return;
+        slog_info("signal {}: stopping, {} connection(s) open", signal, listener->connectionCount());
+        listener->stop();
+    });
+
     ioc.run();
+
+    slog_info("stopped");
 
     return 0;
 }

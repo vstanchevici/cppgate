@@ -5,6 +5,7 @@
 #include "WebSocketSession.h"
 #include <cppgate/Router.h>
 #include <cppgate/ServerOptions.h>
+#include <cppgate/Connections.h>
 #include <deque>
 #include <optional>
 #include <variant>
@@ -15,29 +16,6 @@ namespace gtvr {
 // Define stream types
 using h_plain_t = boost::beast::tcp_stream;
 using h_ssl_t  = boost::beast::ssl_stream<boost::beast::tcp_stream>;
-
-/*
-template <typename T>
-struct is_variant : std::false_type {};
-
-template <typename... Args>
-struct is_variant<std::variant<Args...>> : std::true_type {};
-
-template <typename T>
-inline constexpr bool is_variant_v = is_variant<T>::value;
-
-template<typename F>
-void access_stream(F&& func) {
-    if constexpr (is_variant_v<http_stream_t>) {
-        // Multi-protocol: uses std::visit (minimal jump overhead)
-        std::visit(std::forward<F>(func), stream_);
-    } else {
-        // Single protocol: compiler calls the function DIRECTLY
-        // Zero runtime cost, identical to calling stream_.read()
-        func(stream_);
-    }
-}
-*/
 
 // Declare the type http_stream_t
 template<bool with_plain, bool with_ssl>
@@ -52,26 +30,34 @@ using http_stream_t = std::conditional_t<
 >;
 
 template<bool with_plain, bool with_ssl>
-class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, with_ssl>>
+class HttpSession : public Connection, public std::enable_shared_from_this<HttpSession<with_plain, with_ssl>>
 {
     static_assert(with_plain || with_ssl, "HttpSession must have or plain or ssl stream.");
 
     using std::enable_shared_from_this<HttpSession<with_plain, with_ssl>>::shared_from_this;
 
     private:
-        static constexpr std::size_t                                                            queue_limit = 8; // max responses
         std::deque<boost::beast::http::message_generator>                                       response_queue_;
         boost::optional<boost::beast::http::request_parser<boost::beast::http::string_body>>    parser_;
         boost::beast::flat_buffer                                                               buffer_;
         http_stream_t<with_plain, with_ssl>                                                     stream_;
-    
-        gtvr::router::HttpResponse response_;
+
 
         ServerOptions                                                                           options_;
 
         // Set after an error response: close the connection gracefully, see ServerOptions::http_linger_timeout
         bool                                                                                    linger_ = false;
+        bool                                                                                    lingering_ = false;
         std::vector<char>                                                                       linger_buffer_;
+
+        // Graceful shutdown: the Listener's registry, and whether we wait for the client (detect, handshake, read)
+        std::shared_ptr<Connections>                                                            connections_;
+        bool                                                                                    waiting_ = false;
+
+        bool stopping() const noexcept
+        {
+            return connections_ && connections_->stopping();
+        }
     
     private:
         void queue_write(boost::beast::http::message_generator response, std::shared_ptr<gtvr::router::Router> router)
@@ -90,8 +76,6 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
         // Returns `true` if the caller may initiate a new read
         bool do_write(std::shared_ptr<gtvr::router::Router> router)
         {
-            bool const was_full = response_queue_.size() == queue_limit;
-
             if (!response_queue_.empty())
             {
                 auto main_executor = std::visit([](auto& hs) { return boost::beast::get_lowest_layer(hs).get_executor(); }, stream_);
@@ -123,7 +107,6 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
                 });
             }
 
-            return was_full;
         }
 
         void on_write(std::shared_ptr<gtvr::router::Router> router, bool keep_alive, boost::beast::error_code ec, std::size_t bytes_transferred)
@@ -139,7 +122,8 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
             
             if (response_queue_.empty())
             {
-                if (keep_alive)
+                // While stopping, no new request on this connection
+                if (keep_alive && !stopping())
                     do_read(router);
                 else
                     do_eof();
@@ -151,22 +135,41 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
 
     public:
         // Starts plain, then detects TLS if with_ssl
-        explicit HttpSession(boost::asio::ip::tcp::socket&& socket, const ServerOptions& options) requires (with_plain)
-            : stream_(boost::beast::tcp_stream(std::move(socket))), options_(options)
+        explicit HttpSession(boost::asio::ip::tcp::socket&& socket, const ServerOptions& options, std::shared_ptr<Connections> connections = {}) requires (with_plain)
+            : stream_(boost::beast::tcp_stream(std::move(socket))), options_(options), connections_(std::move(connections))
         {
         }
         
         // SSL only: TLS from the first byte
-        explicit HttpSession(boost::asio::ip::tcp::socket&& socket, boost::asio::ssl::context* ctx, const ServerOptions& options) requires (!with_plain)
-            : stream_(std::in_place_type<h_ssl_t>, std::move(socket), *ctx), options_(options)
+        explicit HttpSession(boost::asio::ip::tcp::socket&& socket, boost::asio::ssl::context* ctx, const ServerOptions& options, std::shared_ptr<Connections> connections = {}) requires (!with_plain)
+            : stream_(std::in_place_type<h_ssl_t>, std::move(socket), *ctx), options_(options), connections_(std::move(connections))
         {
             
+        }
+
+        ~HttpSession()
+        {
+            if (connections_)
+                connections_->remove(this);
+        }
+
+        // Graceful shutdown, from any thread. A request being read or answered is finished first,
+        // a connection waiting for its next request is closed now.
+        void stop() override
+        {
+            boost::beast::net::post(
+                std::visit([](auto& s) { return s.get_executor(); }, stream_),
+                [self = shared_from_this()]() { self->on_stop(); });
         }
         
     
         // Launch the detector
         void run(boost::asio::ssl::context* ctx, std::shared_ptr<gtvr::router::Router> router)
         {
+            // Accepted while the Listener is stopping: returning drops the last reference, the socket closes
+            if (connections_ && !connections_->add(shared_from_this()))
+                return;
+
             // We need to be executing within a strand to perform async operations
             // on the I/O objects in this session. Although not strictly necessary
             // for single-threaded contexts, this example code is written to be
@@ -177,8 +180,20 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
             );
         }
 
+        void on_stop()
+        {
+            // Nothing received yet (idle keep-alive, detect, handshake): cancel, the pending operation
+            // completes with operation_aborted and the session ends. Otherwise the request completes,
+            // and on_write closes instead of reading the next one.
+            // Lingering only keeps the client happy after an error response: a shutdown cuts it short.
+            if (lingering_ || (waiting_ && !(parser_ && parser_->got_some())))
+                std::visit([](auto& hs) { boost::beast::get_lowest_layer(hs).cancel(); }, stream_);
+        }
+
         void on_run(boost::asio::ssl::context* ctx, std::shared_ptr<gtvr::router::Router> router)
         {
+            waiting_ = true;
+
             std::visit([this, self = shared_from_this(), ctx, router](auto& hs) {
                 using T = std::decay_t<decltype(hs)>;
                 
@@ -199,6 +214,8 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
 
         void on_detect(boost::asio::ssl::context* ctx, std::shared_ptr<gtvr::router::Router> router, boost::beast::error_code ec, bool result)
         {
+            waiting_ = false;
+
             if (ec)
             {
                 // Client closed or timed out before sending anything
@@ -237,6 +254,8 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
 
         void on_handshake(std::shared_ptr<gtvr::router::Router> router, boost::beast::error_code ec, std::size_t bytes_used)
         {
+            waiting_ = false;
+
             if (ec)
             {
                 // Bad certificate, plain HTTP on a TLS port, scanners: the client's problem
@@ -264,17 +283,6 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
 
         void on_ssl_session(boost::asio::ssl::context* ctx, std::shared_ptr<gtvr::router::Router> router)
         {
-            /*
-             stream_ = std::visit([&ctx](auto& hs) -> http_stream_t<with_plain, with_ssl> {
-                                 using T = std::decay_t<decltype(hs)>;
-                                 if constexpr (std::is_same_v<T, plain_t>) {
-                                     return ssl_t(std::move(hs), ctx);
-                                 } else {
-                                     return std::move(hs);
-                                 }
-                             }, std::move(stream_));
-             */
-            
             // Try to get a pointer to the existing TCP stream
             if (auto* tcp_ptr = std::get_if<h_plain_t>(&stream_)) {
                 
@@ -296,6 +304,7 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
                     
                     // Perform the SSL handshake
                     // Note, this is the buffered version of the handshake.
+                    waiting_ = true;
                     hs.async_handshake(boost::asio::ssl::stream_base::server, buffer_.data(), boost::beast::bind_front_handler(&HttpSession::on_handshake, this->shared_from_this(), router));
                 }
             }, stream_);
@@ -303,6 +312,8 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
 
         void do_read(std::shared_ptr<gtvr::router::Router> router)
         {
+            waiting_ = true;
+
             // Construct a new parser for each message
             this->parser_.emplace();
 
@@ -312,10 +323,50 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
             
             std::visit([this, router, self = shared_from_this()](auto& hs) mutable
             {
-                // Set the timeout.
+                // Set the timeout, for the whole request
                 boost::beast::get_lowest_layer(hs).expires_after(options_.http_timeout);
                 
-                // Read a request using the parser-oriented interface
+                // The header first: a client sending "Expect: 100-continue" waits for our go before the body
+                boost::beast::http::async_read_header(hs, buffer_, *parser_, boost::beast::bind_front_handler(&HttpSession::on_read_header, std::move(self), router));
+            }, stream_);
+        }
+
+        void on_read_header(std::shared_ptr<gtvr::router::Router> router, boost::beast::error_code ec, std::size_t bytes_transferred)
+        {
+            // Errors (and a body over the limit, known from Content-Length) are answered in on_read
+            if (ec)
+                return on_read(router, ec, bytes_transferred);
+
+            const auto& request = parser_->get();
+
+            if (request.version() >= 11 && boost::beast::iequals(request[boost::beast::http::field::expect], "100-continue"))
+            {
+                static constexpr std::string_view continue_response = "HTTP/1.1 100 Continue\r\n\r\n";
+
+                std::visit([this, router, self = shared_from_this()](auto& hs) mutable
+                {
+                    boost::asio::async_write(hs, boost::asio::buffer(continue_response.data(), continue_response.size()),
+                        [this, router, self = std::move(self)](boost::beast::error_code write_ec, std::size_t) mutable
+                        {
+                            if (write_ec)
+                            {
+                                slog_debug("write 100-continue: {}", write_ec.message());
+                                return;
+                            }
+                            read_body(std::move(router));
+                        });
+                }, stream_);
+                return;
+            }
+
+            read_body(std::move(router));
+        }
+
+        void read_body(std::shared_ptr<gtvr::router::Router> router)
+        {
+            // Continues with the same parser: the header is done, this reads the body (if any)
+            std::visit([this, router, self = shared_from_this()](auto& hs) mutable
+            {
                 boost::beast::http::async_read(hs, buffer_, *parser_, boost::beast::bind_front_handler(&HttpSession::on_read, std::move(self), router));
             }, stream_);
         }
@@ -358,6 +409,7 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
         // response. So after it, keep reading and discarding until the client closes or the timeout.
         void do_linger()
         {
+            lingering_ = true;
             linger_buffer_.resize(16 * 1024);
 
             // One deadline for the whole drain
@@ -440,6 +492,8 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
         {
             boost::ignore_unused(bytes_transferred);
 
+            waiting_ = false;
+
             // This means they closed the connection
             if (ec == boost::beast::http::error::end_of_stream)
                 return do_eof();
@@ -470,7 +524,7 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
                     boost::beast::get_lowest_layer(hs).expires_never();
                     
                     // Create a websocket session, transferring ownership of both the socket and the HTTP request.
-                    auto ws = std::make_shared<WebSocketSession<with_plain, with_ssl>>(std::move(hs), parser_->release(), std::move(peer_ip), options_);
+                    auto ws = std::make_shared<WebSocketSession<with_plain, with_ssl>>(std::move(hs), parser_->release(), std::move(peer_ip), options_, connections_);
 
                     // Routes the upgrade, then accepts or refuses it
                     ws->run(router);
@@ -480,20 +534,18 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
             {
                 // Send the response
                 gtvr::router::HttpRequest req(parser_->get());
-
-                //We do this(=0) to test if response_ has answer
-                response_.beast_res_.result(0);
+                gtvr::router::HttpResponse response;
 
                 // The router works out the client IP from it (trusted proxies)
                 req.setPeerIP(remote_ip());
                 
-                router->route(req, response_);
+                router->route(req, response);
 
-                bool req_keep_alive = response_.keepAlive();
+                // Tell the client this connection ends after the response
+                if (stopping())
+                    response.keepAlive(false);
 
-                queue_write(boost::beast::http::message_generator(std::move(response_.beast_res_)), router);
-
-                response_.beast_res_ = {};                               
+                queue_write(boost::beast::http::message_generator(std::move(response.beast_res_)), router);
             }
         }
 };

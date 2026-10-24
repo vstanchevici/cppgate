@@ -20,7 +20,7 @@ Tests (Catch2 comes from the conanfile as a `test_requires`):
 ```sh
 cmake build/xcode -DBUILD_TESTING=ON
 cmake --build build/xcode --config Debug --target test_router
-./build/xcode/Debug/test_router            # also test_trusted_proxies, test_ring_buffer; or: ctest --test-dir build/xcode -C Debug
+./build/xcode/Debug/test_router            # also test_listener (real sockets), test_trusted_proxies, test_ring_buffer; or: ctest --test-dir build/xcode -C Debug
 ```
 ThreadSanitizer build (Ninja, separate folder, reuses the Conan toolchain):
 ```sh
@@ -32,21 +32,22 @@ cmake --build build/tsan && ./build/tsan/test_router "[threads]"
 
 CMake options: `BUILD_TESTING` (OFF), `BUILD_EXAMPLES` (OFF; each `examples/*` dir is added), `BUILD_SHARED_LIBS`.
 
-`examples/echo` is an HTTP + WebSocket echo server (`./build/xcode/Debug/echo_server [port] [cert.pem key.pem [tls-only]]`; with a certificate it serves HTTP+HTTPS on one port, or HTTPS only). The library build alone does not instantiate the session templates (`HttpSession`, `WebSocketSession`, `Listener::Run`), so build the example to check they compile.
+`examples/echo` is an HTTP + WebSocket echo server (`./build/xcode/Debug/echo_server [port] [cert.pem key.pem [tls-only]]`; with a certificate it serves HTTP+HTTPS on one port, or HTTPS only). The library build alone does not instantiate the session templates (`HttpSession`, `WebSocketSession`, `Listener::run`), so build the example to check they compile.
 
 ## Layout
 
 - `include/cppgate/` — public headers. Much of the logic is header-only templates (`Listener`, `HttpSession`, `WebSocketSession`). `RingBuffer.h` (lock-free MPMC queue) is currently unused, kept for later.
-- `sources/Core/` — `Router.cpp`, `Log.cpp`.
-- `sources/BoostBeast/` — session/listener translation units.
+- `sources/Core/` — `Router.cpp`, `Log.cpp`, `TrustedProxies.cpp`. The sessions and the Listener are header-only.
 - CMake also globs `sources/{Authentication,Handlers}` and the matching include dirs; they don't exist yet but are where new modules are expected to go. New `.cpp`/`.h` files in these dirs are picked up automatically (`find_source_files` in `cmake/Tools.cmake`) — re-run CMake configure after adding files.
 - `tests/<name>/` — each subdir is its own CMake project using Catch2.
 
 ## Architecture
 
-- `Listener` accepts TCP connections; `Run<flags>()` takes a `Protocol` bitmask (`HTTP | HTTPS | WS | WSS`) resolved at compile time, and spawns `HttpSession<plain, ssl>` per connection on its own strand.
+- `Listener` accepts TCP connections; `run<flags>()` takes a `Protocol` bitmask (`HTTP | HTTPS | WS | WSS`) resolved at compile time, and spawns `HttpSession<plain, ssl>` per connection on its own strand.
   - With plain support the session starts plain and `async_detect_ssl` switches to TLS when HTTPS is enabled (HTTP and HTTPS on one port); HTTPS alone does the handshake from the first byte. A TLS client on a plain-only listener is closed at once.
-  - Any SSL flag needs `SetSSLContext()` before `Run()` (throws `std::logic_error` otherwise); the context must outlive the Listener. The WS/WSS flags change nothing today: upgrades are accepted on any listener.
+  - The constructor throws `boost::system::system_error` if the address can't be used (port in use). Accept errors never stop the loop: client aborts retry at once, resource errors (EMFILE...) retry after 100 ms. `localEndpoint()` gives the bound port (useful with port 0).
+  - Graceful shutdown: `stop()` (any thread) closes the acceptor and calls `Connections::stopAll()`. Sessions register in the shared `Connections` registry (`Connection::stop()`); idle HTTP connections are cancelled, a request in progress finishes with `Connection: close`, WebSockets close with 1001, upgrades during shutdown get 503, a lingering close is cut short. `io_context::run()` then returns on its own.
+  - Any SSL flag needs `setSSLContext()` before `run()` (throws `std::logic_error` otherwise); the context must outlive the Listener. The WS/WSS flags change nothing today: upgrades are accepted on any listener.
 - `Router` matches routes by regex (RE2) built from paths like `/users/{id}`; supports method sets, groups with prefixes, and pre/post middlewares. A `Handler` is `std::variant<HttpHandler, WebSocketHandler>`.
 - `RouteParams` lives on the stack of `Router::route()`: a fixed array of 8 `string_view` pairs, heap only beyond that. Values are views into the request path — don't outlive the request. `Router::initialize()` is a deprecated no-op.
 - `HttpRequest`/`HttpResponse` are thin wrappers over Beast's `request/response<string_body>`.
@@ -58,18 +59,19 @@ CMake options: `BUILD_TESTING` (OFF), `BUILD_EXAMPLES` (OFF; each `examples/*` d
 - HTTP routing skips WebSocket routes and vice versa; routes only run middlewares of their own kind (`std::get_if`), so groups can mix both.
 - Logging: use the `slog_trace/debug/info/warn/error/critical` macros from `Log.h` (spdlog, fmt-style format strings).
 - Log level rule: anything a client can cause (bad/oversized requests, disconnects, timeouts) is `slog_debug`, never error, otherwise clients can flood the logs.
-- `ServerOptions` (`Listener::SetOptions`, before `Run`) holds the HTTP header/body limits, timeouts and WebSocket limits; sessions keep a copy. Parser errors get a real response (400, 413 body, 414 URL, 431 headers) with `Connection: close`, then a lingering close (`http_linger_timeout`) that drains the rest of the request so the client reads the response instead of a reset (plain and TLS; over TLS it drains instead of sending close_notify).
+- `ServerOptions` (`Listener::setOptions`, before `run`) holds the HTTP header/body limits, timeouts and WebSocket limits; sessions keep a copy. Parser errors get a real response (400, 413 body, 414 URL, 431 headers) with `Connection: close`, then a lingering close (`http_linger_timeout`) that drains the rest of the request so the client reads the response instead of a reset (plain and TLS; over TLS it drains instead of sending close_notify). Requests with `Expect: 100-continue` get `100 Continue` after the header is read (`async_read_header`, then the body), or the 413 straight away.
+- WebSocket sends go through a queue of `websocket_send_queue_limit` messages; a client that can't keep up is closed with 1008. `pendingMessages()` (any thread) lets the app skip slow clients.
 
 ## Conventions
 
 - 4-space indentation, `access:` labels indented inside classes, braces on their own line for functions/control flow.
 - Public classes are exported with `CPPGATE_API` (`cppgate.h`); it's defined empty for static builds.
-- Methods: mostly camelCase (`setRouter`, `sendJSON`); some older ones are PascalCase (`Run`, `SetSSLContext`, `OnMessage`). Match the surrounding class.
+- Public methods are camelCase (`run`, `setRouter`, `sendJSON`). Old PascalCase Listener names (`Run`, `SetRouter`, `SetSSLContext`, `SetOptions`) remain as `[[deprecated]]` forwarders. Exception: `Logger::Init/Get`. Session internals follow Beast's snake_case (`do_read`, `on_write`).
 - Members use a trailing underscore (`routes_`, `router_`).
 
 ## Testing notes
 
 - Router tests need no network: build a Beast `request`, wrap it in `HttpRequest`, call `router.route(req, res)`, inspect `res.beast_res_`. See `tests/router/test_router.cpp`.
 - No setup needed before `route()`. If `RingBuffer` is used again: `pop()` can fail while items are free (a concurrent push in progress), never treat a failed pop as an error.
-- A fresh `HttpResponse` must get `beast_res_.result(0)` before routing — Beast defaults to 200, and `hasResponse()` treats non-zero as "already answered". `HttpSession` does this reset; tests must too.
+- A new `HttpResponse` starts with status 0 ("no response yet", see `hasResponse()`); Beast's own default would be 200. Use one per request.
 - Link only `Boost::headers Boost::url`, never `boost::boost`: it pulls in Boost.Test's `main()`, which clashes with Catch2.
