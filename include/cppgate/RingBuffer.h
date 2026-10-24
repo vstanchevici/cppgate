@@ -92,21 +92,35 @@ public:
         return true;
     }
 
+    // Returns false when empty, but also when the next item's push() is still in progress
+    // (a producer claimed the slot and has not published it yet), even if later slots are full.
     bool pop(T& out) {
         uint64_t pos = tail.load(std::memory_order_relaxed);
-        Slot& slot = buffer[pos & Mask];
 
-        // If sequence == pos + 1, data is ready for us
-        if (slot.sequence.load(std::memory_order_acquire) == pos + 1) {
-            if (tail.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
-                //out = std::atomic_ref<T>(slot.data).load(std::memory_order_relaxed);
-                out = slot.data;
+        for (;;) {
+            Slot& slot = buffer[pos & Mask];
+            int64_t diff = static_cast<int64_t>(slot.sequence.load(std::memory_order_acquire)) - static_cast<int64_t>(pos + 1);
 
-                // Signal Producer: "Slot is free for the next LAP (pos + Size)"
-                slot.sequence.store(pos + Size, std::memory_order_release);
-                return true;
+            // If sequence == pos + 1, data is ready for us
+            if (diff == 0) {
+                if (tail.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
+                    //out = std::atomic_ref<T>(slot.data).load(std::memory_order_relaxed);
+                    out = slot.data;
+
+                    // Signal Producer: "Slot is free for the next LAP (pos + Size)"
+                    slot.sequence.store(pos + Size, std::memory_order_release);
+                    return true;
+                }
+                // Another consumer took it (or a spurious failure): pos was reloaded, try again
+            }
+            else if (diff < 0) {
+                // Nothing produced at this position yet
+                return false;
+            }
+            else {
+                // Another consumer moved past us
+                pos = tail.load(std::memory_order_relaxed);
             }
         }
-        return false;
     }
 };
