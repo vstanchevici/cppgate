@@ -86,14 +86,33 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
 
             if (!response_queue_.empty())
             {
-                boost::beast::http::message_generator msg = std::move(response_queue_.front());
+                auto main_executor = std::visit([](auto& hs) { return boost::beast::get_lowest_layer(hs).get_executor(); }, stream_);
 
-                bool keep_alive = msg.keep_alive();
+                // Create a strong shared reference before posting
+                auto self = shared_from_this();
 
-                std::visit([this, &msg, router, keep_alive](auto& hs)
+                // Capture 'self' by value to secure the object lifetime
+                boost::asio::post(main_executor, [this, self, router]() mutable
                 {
-                    boost::beast::async_write(hs, std::move(msg), boost::beast::bind_front_handler(&HttpSession::on_write, shared_from_this(), router, keep_alive));
-                }, stream_);
+                    if (response_queue_.empty()) return;
+
+                    boost::beast::http::message_generator msg = std::move(response_queue_.front());
+                    response_queue_.pop_front();
+
+                    const bool keep_alive = msg.keep_alive();
+
+                    std::visit([this, self, msg = std::move(msg), router, keep_alive](auto& hs) mutable
+                    {
+                        auto stream_executor = boost::beast::get_lowest_layer(hs).get_executor();
+
+                        auto bound_handler = boost::asio::bind_executor(
+                            stream_executor,
+                            boost::beast::bind_front_handler(&HttpSession::on_write, self, router, keep_alive)
+                        );
+
+                        boost::beast::async_write(hs, std::move(msg), std::move(bound_handler));
+                    }, stream_);
+                });
             }
 
             return was_full;
@@ -106,24 +125,19 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
             if (ec)
             {
                 slog_error("{}", ec.message());
+                do_eof(); // Clean up socket descriptors and self references safely
                 return;
             }
-
-            if (!keep_alive)
-            {
-                // This means we should close the connection, usually because
-                // the response indicated the "Connection: close" semantic.
-                return do_eof();
-            }
-
-            response_queue_.pop_front();
             
-            // Inform the queue that a write completed
-            if (do_write(router))
+            if (response_queue_.empty())
             {
-                // Read another request
-                do_read(router);
+                if (keep_alive)
+                    do_read(router);
+                else
+                    do_eof();
             }
+            else
+                do_write(router);
         }
 
 
@@ -160,7 +174,7 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
                     // Set the timeout.
                     hs.expires_after(std::chrono::seconds(30));
 
-                    boost::beast::async_detect_ssl(hs, buffer_, boost::beast::bind_front_handler(&HttpSession::on_detect, shared_from_this(), ctx, std::move(router)));
+                    boost::beast::async_detect_ssl(hs, buffer_, boost::beast::bind_front_handler(&HttpSession::on_detect, this->shared_from_this(), ctx, std::move(router)));
                 }
             }, stream_);
         }
@@ -256,7 +270,7 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
                     
                     // Perform the SSL handshake
                     // Note, this is the buffered version of the handshake.
-                    hs.async_handshake(boost::asio::ssl::stream_base::server, buffer_.data(), boost::beast::bind_front_handler(&HttpSession::on_handshake, shared_from_this(), router));
+                    hs.async_handshake(boost::asio::ssl::stream_base::server, buffer_.data(), boost::beast::bind_front_handler(&HttpSession::on_handshake, this->shared_from_this(), router));
                 }
             }, stream_);
         }
@@ -293,7 +307,7 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
                     boost::beast::get_lowest_layer(hs).expires_after(std::chrono::seconds(30));
 
                     // Perform the SSL shutdown
-                    hs.async_shutdown(boost::beast::bind_front_handler(&HttpSession::on_shutdown, shared_from_this()));
+                    hs.async_shutdown(boost::beast::bind_front_handler(&HttpSession::on_shutdown, this->shared_from_this()));
                 }
                 else
                 {
@@ -339,23 +353,33 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
             {
                 // Send the response
                 gtvr::router::HttpRequest req(parser_->get());
-                response_.beast_res_.result(0); //We do this(=0) to test if response_ has answer
+
+                //We do this(=0) to test if response_ has answer
+                response_.beast_res_.result(0);
+
+                //here we take ip and assign to request
+                std::visit([this, &req](auto& hs)
+                {
+                    boost::system::error_code ec;
+
+                    auto remote_endpoint = boost::beast::get_lowest_layer(hs).socket().remote_endpoint(ec);                    
+
+                    std::string client_ip = "UNKNOWN";
+
+                    if (!ec) {
+                        client_ip = remote_endpoint.address().to_string();
+                    }
+
+                    req.setIP(client_ip);
+                }, stream_);
+                
                 router->route(req, response_);
 
                 bool req_keep_alive = response_.keepAlive();
 
                 queue_write(boost::beast::http::message_generator(std::move(response_.beast_res_)), router);
 
-                response_.beast_res_ = {};
-
-                // If we aren't at the queue limit, try to pipeline another request
-                if (response_queue_.size() < queue_limit)
-                {
-                    if (req_keep_alive)
-                        do_read(router);
-                    else
-                        do_eof();
-                }
+                response_.beast_res_ = {};                               
             }
         }
 };
