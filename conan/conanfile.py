@@ -100,6 +100,9 @@ class CppGateConan(ConanFile):
         self.requires("openssl/[>=3.3.1 <4.0]")
         self.requires("spdlog/1.15.1")
 
+    def build_requirements(self):
+        self.test_requires("catch2/3.8.1")
+
     def generate(self):
         deps = CMakeDeps(self)
         deps.generate()

@@ -182,7 +182,7 @@ endif()
 
 # Add libraries
 find_package(Boost CONFIG REQUIRED)
-target_link_libraries(${PROJECT_NAME} PRIVATE boost::boost)
+target_link_libraries(${PROJECT_NAME} PRIVATE Boost::headers Boost::url)
 
 # add openssl
 set_property(GLOBAL PROPERTY FIND_LIBRARY_USE_LIB64_PATHS TRUE)
