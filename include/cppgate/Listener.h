@@ -3,6 +3,7 @@
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/strand.hpp>
 #include <cppgate/Router.h>
+#include <cppgate/ServerOptions.h>
 #include "HttpSession.h"
 
 namespace gtvr {  
@@ -59,6 +60,7 @@ namespace gtvr {
             boost::asio::ssl::context*              ctx_;
             boost::asio::ip::tcp::acceptor          acceptor_;
             std::shared_ptr<gtvr::router::Router>   router_;
+            ServerOptions                           options_;
 
         public:
             Listener(boost::beast::net::io_context& ioc, boost::asio::ip::tcp::endpoint endpoint): ioc_(ioc), acceptor_(boost::beast::net::make_strand(ioc))
@@ -115,6 +117,12 @@ namespace gtvr {
             {
                 router_ = router;
             }
+
+            // Limits and timeouts, call before Run()
+            void SetOptions(const ServerOptions& options)
+            {
+                options_ = options;
+            }
         
         private:
             template<uint8_t flags>
@@ -139,9 +147,9 @@ namespace gtvr {
                     
                     // Create the detector http_session and run it
                     if constexpr ((support_ssl == false) && (support_plain == false))
-                        std::make_shared<HttpSession<support_plain, support_ssl>>(std::move(socket), ctx_)->run(ctx_, router_);
+                        std::make_shared<HttpSession<support_plain, support_ssl>>(std::move(socket), ctx_, options_)->run(ctx_, router_);
                     else
-                        std::make_shared<HttpSession<support_plain, support_ssl>>(std::move(socket))->run(ctx_, router_);
+                        std::make_shared<HttpSession<support_plain, support_ssl>>(std::move(socket), options_)->run(ctx_, router_);
                 }
 
                 // Accept another connection

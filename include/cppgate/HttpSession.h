@@ -4,7 +4,9 @@
 #include <boost/beast/ssl.hpp>
 #include "WebSocketSession.h"
 #include <cppgate/Router.h>
+#include <cppgate/ServerOptions.h>
 #include <deque>
+#include <optional>
 #include <variant>
 
 namespace gtvr {
@@ -64,6 +66,12 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
         http_stream_t<with_plain, with_ssl>                                                     stream_;
     
         gtvr::router::HttpResponse response_;
+
+        ServerOptions                                                                           options_;
+
+        // Set after an error response: close the connection gracefully, see ServerOptions::http_linger_timeout
+        bool                                                                                    linger_ = false;
+        std::vector<char>                                                                       linger_buffer_;
     
     private:
         void queue_write(boost::beast::http::message_generator response, std::shared_ptr<gtvr::router::Router> router)
@@ -142,11 +150,11 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
 
 
     public:
-        explicit HttpSession(boost::asio::ip::tcp::socket&& socket): stream_(boost::beast::tcp_stream(std::move(socket)))
+        explicit HttpSession(boost::asio::ip::tcp::socket&& socket, const ServerOptions& options): stream_(boost::beast::tcp_stream(std::move(socket))), options_(options)
         {
         }
         
-        explicit HttpSession(boost::asio::ip::tcp::socket&& socket, boost::asio::ssl::context* ctx): stream_(std::in_place_type<h_ssl_t>, std::move(socket), *ctx)
+        explicit HttpSession(boost::asio::ip::tcp::socket&& socket, boost::asio::ssl::context* ctx, const ServerOptions& options): stream_(std::in_place_type<h_ssl_t>, std::move(socket), *ctx), options_(options)
         {
             
         }
@@ -172,7 +180,7 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
                 
                 if constexpr (std::is_same_v<T, h_plain_t>) {
                     // Set the timeout.
-                    hs.expires_after(std::chrono::seconds(30));
+                    hs.expires_after(options_.http_timeout);
 
                     boost::beast::async_detect_ssl(hs, buffer_, boost::beast::bind_front_handler(&HttpSession::on_detect, this->shared_from_this(), ctx, std::move(router)));
                 }
@@ -183,7 +191,8 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
         {
             if (ec)
             {
-                slog_error("{}", ec.message());
+                // Client closed or timed out before sending anything
+                slog_debug("detect: {}", ec.message());
                 return;
             }
 
@@ -266,7 +275,7 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
                 
                 if constexpr (std::is_same_v<T, h_ssl_t>) {
                     // Set the timeout.
-                    boost::beast::get_lowest_layer(hs).expires_after(std::chrono::seconds(30));
+                    boost::beast::get_lowest_layer(hs).expires_after(options_.http_timeout);
                     
                     // Perform the SSL handshake
                     // Note, this is the buffered version of the handshake.
@@ -280,14 +289,14 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
             // Construct a new parser for each message
             this->parser_.emplace();
 
-            // Apply a reasonable limit to the allowed size
-            // of the body in bytes to prevent abuse.
-            this->parser_->body_limit(10000);
+            // Limits to prevent abuse, over them the client gets 413 / 414 / 431
+            this->parser_->header_limit(static_cast<std::uint32_t>(options_.http_header_limit));
+            this->parser_->body_limit(options_.http_body_limit);
             
             std::visit([this, router, self = shared_from_this()](auto& hs) mutable
             {
                 // Set the timeout.
-                boost::beast::get_lowest_layer(hs).expires_after(std::chrono::seconds(30));
+                boost::beast::get_lowest_layer(hs).expires_after(options_.http_timeout);
                 
                 // Read a request using the parser-oriented interface
                 boost::beast::http::async_read(hs, buffer_, *parser_, boost::beast::bind_front_handler(&HttpSession::on_read, std::move(self), router));
@@ -304,7 +313,7 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
                 if constexpr (std::is_same_v<T, h_ssl_t>)
                 {
                     // Set the timeout.
-                    boost::beast::get_lowest_layer(hs).expires_after(std::chrono::seconds(30));
+                    boost::beast::get_lowest_layer(hs).expires_after(options_.http_timeout);
 
                     // Perform the SSL shutdown
                     hs.async_shutdown(boost::beast::bind_front_handler(&HttpSession::on_shutdown, this->shared_from_this()));
@@ -313,6 +322,9 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
                 {
                     boost::beast::error_code ec;
                     hs.socket().shutdown(boost::asio::ip::tcp::socket::shutdown_send, ec);
+
+                    if (linger_)
+                        do_linger();
                 }
                 
             }, stream_);
@@ -320,7 +332,92 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
             // At this point the connection is closed gracefully
         }
 
+        // Closing a socket with unread data sends a reset, which can make the client lose our error
+        // response. So after it, keep reading and discarding until the client closes or the timeout.
+        void do_linger()
+        {
+            if constexpr (with_plain)
+            {
+                if (auto* hs = std::get_if<h_plain_t>(&stream_))
+                {
+                    linger_buffer_.resize(16 * 1024);
+
+                    // One deadline for the whole drain
+                    hs->expires_after(options_.http_linger_timeout);
+                    read_linger();
+                }
+            }
+        }
+
+        void read_linger()
+        {
+            if constexpr (with_plain)
+            {
+                std::get<h_plain_t>(stream_).async_read_some(boost::asio::buffer(linger_buffer_), boost::beast::bind_front_handler(&HttpSession::on_linger, shared_from_this()));
+            }
+        }
+
+        void on_linger(boost::beast::error_code ec, std::size_t bytes_transferred)
+        {
+            boost::ignore_unused(bytes_transferred);
+
+            // EOF, timeout or reset: done, the socket closes with the session
+            if (!ec)
+                read_linger();
+        }
+
+        // The response for a request the parser refused, or nothing when there is no one to answer
+        std::optional<boost::beast::http::status> error_status(boost::beast::error_code ec)
+        {
+            namespace http = boost::beast::http;
+
+            if (ec == http::error::body_limit)
+                return http::status::payload_too_large;                     // 413
+
+            if (ec == http::error::header_limit)
+            {
+                // The parser consumes the request line as soon as it is complete: if there is no target
+                // yet, the request line itself (the URL) did not fit, otherwise the headers did not
+                return parser_->get().target().empty()
+                    ? http::status::uri_too_long                            // 414
+                    : http::status::request_header_fields_too_large;        // 431
+            }
+
+            // Any other parse error is a malformed request, except a client that left mid-request
+            if (ec.category() == http::make_error_code(http::error::bad_method).category()
+                && ec != http::error::partial_message
+                && ec != http::error::need_more)
+                return http::status::bad_request;                           // 400
+
+            return std::nullopt;
+        }
+
+        void send_error(boost::beast::http::status status, std::shared_ptr<gtvr::router::Router> router)
+        {
+            boost::beast::http::response<boost::beast::http::string_body> res{ status, 11 };
+            res.set(boost::beast::http::field::content_type, "text/plain");
+            res.body() = std::string(boost::beast::http::obsolete_reason(status));
+            res.keep_alive(false);
+            res.prepare_payload();
+
+            linger_ = true;
+
+            queue_write(boost::beast::http::message_generator(std::move(res)), router);
+        }
+
         
+        std::string remote_ip()
+        {
+            return std::visit([](auto& hs)
+            {
+                boost::system::error_code ec;
+
+                auto remote_endpoint = boost::beast::get_lowest_layer(hs).socket().remote_endpoint(ec);
+
+                return ec ? std::string("UNKNOWN") : remote_endpoint.address().to_string();
+            }, stream_);
+        }
+
         void on_read(std::shared_ptr<gtvr::router::Router> router, boost::beast::error_code ec, std::size_t bytes_transferred)
         {
             boost::ignore_unused(bytes_transferred);
@@ -331,7 +428,15 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
 
             if (ec)
             {
-                slog_error("{}", ec.message());
+                // A client mistake, not a server failure: debug level, or anyone could flood the logs
+                if (auto status = error_status(ec))
+                {
+                    slog_debug("rejected request ({}): {}", static_cast<int>(*status), ec.message());
+                    return send_error(*status, router);
+                }
+
+                // Timeout, reset, client gone mid-request: nobody to answer
+                slog_debug("read: {}", ec.message());
                 return;
             }
 
@@ -339,14 +444,18 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
             // See if it is a WebSocket Upgrade
             if (boost::beast::websocket::is_upgrade(parser_->get()))
             {
-                std::visit([this, router](auto& hs)
+                std::string peer_ip = remote_ip();
+
+                std::visit([this, router, &peer_ip](auto& hs)
                 {
                     // Disable the timeout.
                     boost::beast::get_lowest_layer(hs).expires_never();
                     
                     // Create a websocket session, transferring ownership of both the socket and the HTTP request.
-                    auto ws = std::make_shared<WebSocketSession<with_plain, with_ssl>>(std::move(hs));
-                    ws->run(std::move(parser_->release()), router);
+                    auto ws = std::make_shared<WebSocketSession<with_plain, with_ssl>>(std::move(hs), parser_->release(), std::move(peer_ip), options_);
+
+                    // Routes the upgrade, then accepts or refuses it
+                    ws->run(router);
                 }, stream_);
             }
             else
@@ -357,21 +466,8 @@ class HttpSession : public std::enable_shared_from_this<HttpSession<with_plain, 
                 //We do this(=0) to test if response_ has answer
                 response_.beast_res_.result(0);
 
-                //here we take ip and assign to request
-                std::visit([this, &req](auto& hs)
-                {
-                    boost::system::error_code ec;
-
-                    auto remote_endpoint = boost::beast::get_lowest_layer(hs).socket().remote_endpoint(ec);                    
-
-                    std::string client_ip = "UNKNOWN";
-
-                    if (!ec) {
-                        client_ip = remote_endpoint.address().to_string();
-                    }
-
-                    req.setIP(client_ip);
-                }, stream_);
+                // The router works out the client IP from it (trusted proxies)
+                req.setPeerIP(remote_ip());
                 
                 router->route(req, response_);
 

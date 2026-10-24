@@ -1,5 +1,4 @@
 #include <cppgate/Router.h>
-#include <cppgate/WebSocketSession.h>
 
 namespace gtvr::router {
 
@@ -61,17 +60,25 @@ namespace gtvr::router {
     {      
         // We need N + 1 slots: index 0 is the full match, 1..N are our parameters
         int num_params = static_cast<int>(param_names.size());
-        std::vector<std::string_view> captures(num_params + 1);
 
-        if (num_params > 0)
-            params.params.clear();
+        // On the stack for usual routes, the heap only for routes with many params
+        std::array<std::string_view, RouteParams::inline_capacity + 1> inline_captures;
+        std::vector<std::string_view> heap_captures;
+        std::string_view* captures = inline_captures.data();
+        if (num_params > static_cast<int>(RouteParams::inline_capacity))
+        {
+            heap_captures.resize(num_params + 1);
+            captures = heap_captures.data();
+        }
+
+        params.reset();
 
         // We use Match() with ANCHOR_BOTH to ensure the pattern spans the entire URL
-        if (pattern->Match(input, 0, input.size(), re2::RE2::ANCHOR_BOTH, captures.data(), captures.size()))
+        if (pattern->Match(input, 0, input.size(), re2::RE2::ANCHOR_BOTH, captures, num_params + 1))
         {
             for (int i = 0; i < num_params; ++i) {
                 // captures[0] is the whole string, so we start at index 1
-                params.params.push_back({ param_names[i], captures[i + 1] });
+                params.add(param_names[i], captures[i + 1]);
                 //slog_info("name: {0}, key:{1}", param_names[i], captures[i + 1]);
             }
             return true;
@@ -85,13 +92,21 @@ namespace gtvr::router {
         return methods.count(method);
     }
 
+    bool Router::Route::isWebSocket() const
+    {
+        return std::holds_alternative<WebSocketHandler>(handler);
+    }
+
     void Router::Route::operator()(HttpRequest& request, HttpResponse& response) const
     {
         for (auto& middleware : pre_middlewares)
-        {           
-            std::get<HttpHandler>(middleware)(request, response);
-            if (response.hasResponse())
-                break;
+        {
+            if (auto* fn = std::get_if<HttpHandler>(&middleware))
+            {
+                (*fn)(request, response);
+                if (response.hasResponse())
+                    break;
+            }
         }
 
         if (!response.hasResponse())
@@ -102,37 +117,42 @@ namespace gtvr::router {
             {
                 for (auto& middleware : post_middlewares)
                 {
-                    std::get<HttpHandler>(middleware)(request, response);
-                    if (response.hasResponse())
-                        break;
+                    if (auto* fn = std::get_if<HttpHandler>(&middleware))
+                    {
+                        (*fn)(request, response);
+                        if (response.hasResponse())
+                            break;
+                    }
                 }
             }
         }
-    }        
+    }
 
-    void Router::Route::operator()(std::shared_ptr<WebSocketSessionInterface> session) const
-    {  
-        bool next_one = true;
-
+    bool Router::Route::upgrade(std::shared_ptr<WebSocketContext> ws) const
+    {
         for (auto& middleware : pre_middlewares)
         {
-            next_one = std::get<WebSocketHandler>(middleware)(session);
-            if (next_one == false)
-                break;
+            if (auto* fn = std::get_if<WebSocketHandler>(&middleware))
+            {
+                if (!(*fn)(ws))
+                    return false;
+            }
         }
 
-        if (next_one)
-        {
-            next_one = std::get<WebSocketHandler>(handler)(session);
+        return true;
+    }
 
-            if (next_one)
+    void Router::Route::open(std::shared_ptr<WebSocketContext> ws) const
+    {
+        if (!std::get<WebSocketHandler>(handler)(ws))
+            return;
+
+        for (auto& middleware : post_middlewares)
+        {
+            if (auto* fn = std::get_if<WebSocketHandler>(&middleware))
             {
-                for (auto& middleware : post_middlewares)
-                {
-                    next_one = std::get<WebSocketHandler>(middleware)(session);
-                    if (next_one == false)
-                        break;
-                }
+                if (!(*fn)(ws))
+                    break;
             }
         }
     }
@@ -143,6 +163,31 @@ namespace gtvr::router {
 
     void Router::setMethodNotAllowedHandler(Handler handler) {
         method_not_allowed_handler = std::move(handler);
+    }
+
+    void Router::setTrustedProxies(const std::vector<std::string>& cidrs)
+    {
+        // Built completely before being published, a request never sees a half-filled list
+        auto proxies = std::make_shared<TrustedProxies>();
+        for (const auto& cidr : cidrs)
+            proxies->add(cidr);
+
+        std::shared_ptr<const TrustedProxies> published = std::move(proxies);
+
+        #ifdef __cpp_lib_atomic_shared_ptr
+            trusted_proxies_.store(std::move(published));
+        #else
+            std::atomic_store(&trusted_proxies_, std::move(published));
+        #endif
+    }
+
+    std::shared_ptr<const TrustedProxies> Router::trustedProxies() const
+    {
+        #ifdef __cpp_lib_atomic_shared_ptr
+            return trusted_proxies_.load();
+        #else
+            return std::atomic_load(&trusted_proxies_);
+        #endif
     }
 
     void Router::group(const std::string& prefix, const std::vector<Handler>& pre_middlewares, const std::vector<Handler>& post_middlewares, const std::function<void(Router&)>& fn)
@@ -214,33 +259,11 @@ namespace gtvr::router {
         routes_.push_back(std::move(entry));
     }
 
-    void Router::initialize(size_t buffersCount, size_t bufferSize)
-    {
-        // Resize the vector to hold the actual objects.
-        // This allocates the memory for all RouteParams instances.
-        buffers_.reserve(buffersCount);
-
-        params_ = std::make_unique<RingBuffer<RouteParams*>>();
-        params_->create(buffersCount);
-
-        for (size_t i = 0; i < buffersCount; ++i) {           
-            // Create the object on the heap
-            auto new_buffer = std::make_unique<RouteParams>(bufferSize);
-
-            // Store the raw pointer in the RingBuffer BEFORE moving ownership
-            // This is safe because the unique_ptr still owns it here.
-            if (!params_->push(new_buffer.get())) {
-                throw std::runtime_error("RingBuffer push failed");
-            }
-
-            // Move ownership into the vector
-            buffers_.push_back(std::move(new_buffer));
-        }
-    }
-
     void Router::route(HttpRequest& request, HttpResponse& response)
     {
         bool path_matched = false;
+
+        request.setIP(trustedProxies()->resolve(request.getPeerIP(), request.request));
 
         auto url = boost::urls::parse_uri_reference(request.target());
         
@@ -248,13 +271,18 @@ namespace gtvr::router {
         {
             auto path = url.value().path();
 
-            if (params_->pop(request.params))
+            // On the stack: owned by this call only, nothing shared between threads or requests
+            RouteParams params;
+            request.params = &params;
+
             {
-                request.params->reset();
 
                 for (const auto& route : routes_)
                 {
-                    if (route.PathMatch(path, const_cast<RouteParams&>(*request.params)))
+                    if (route.isWebSocket())
+                        continue;
+
+                    if (route.PathMatch(path, *request.params))
                     {
                         path_matched = true;
 
@@ -275,7 +303,8 @@ namespace gtvr::router {
                             if (internal_server_error)
                                 std::get<HttpHandler>(internal_server_error_handler)(request, response);        // 500
 
-                            params_->push(request.params);
+                            // params dies with this call, don't leave a dangling pointer
+                            request.params = nullptr;
 
                             return;
                         }
@@ -287,11 +316,7 @@ namespace gtvr::router {
                 else
                     std::get<HttpHandler>(not_found_handler)(request, response);            // 404
 
-                params_->push(request.params);
-            }
-            else
-            {
-                std::get<HttpHandler>(method_not_allowed_handler)(request, response);       // 405
+                request.params = nullptr;
             }
         }
         else
@@ -300,31 +325,79 @@ namespace gtvr::router {
         }
     }
 
-    void Router::route(std::shared_ptr<WebSocketSessionInterface> session)
+    bool Router::upgrade(std::shared_ptr<WebSocketContext> ws, HttpResponse& response)
     {
-        auto url = boost::urls::parse_uri_reference(session->getRequest().target());
+        ws->ip_ = trustedProxies()->resolve(ws->peer_ip_, ws->request());
 
-        if (url.has_value())
+        HttpRequest request(ws->request());
+        request.setPeerIP(ws->peer_ip_);
+        request.setIP(ws->ip_);
+
+        auto url = boost::urls::parse_uri_reference(ws->request().target());
+
+        if (!url.has_value())
         {
-            auto path = url.value().path();
+            std::get<HttpHandler>(internal_server_error_handler)(request, response);        // 500
+            return false;
+        }
 
-            for (const auto& route : routes_)
-            {
-                if (url.has_value())
-                {
-                    RouteParams* rp;
+        auto path = url.value().path();
 
-                    if (params_->pop(rp))
-                    {
-                        if (route.PathMatch(path, const_cast<RouteParams&>(*rp)))
-                            route(session);
+        RouteParams params;
 
-                        rp->reset();
-                        params_->push(rp);
-                        return;
-                    }
-                }
+        for (size_t i = 0; i < routes_.size(); ++i)
+        {
+            const auto& route = routes_[i];
+
+            if (!route.isWebSocket() || !route.PathMatch(path, params))
+                continue;
+
+            // The connection outlives the request, so it keeps its own copy of the params
+            ws->params_.clear();
+            params.forEach([&ws](std::string_view key, std::string_view value) {
+                ws->params_.emplace_back(std::string(key), std::string(value));
+            });
+
+            bool accepted = false;
+
+            try {
+                accepted = route.upgrade(ws);
             }
+            catch (...)
+            {
+                std::get<HttpHandler>(internal_server_error_handler)(request, response);    // 500
+                return false;
+            }
+
+            if (!accepted)
+            {
+                if (ws->reject_status_ == boost::beast::http::status::unknown)
+                    response.send(boost::beast::http::status::forbidden, "Forbidden");     // 403
+                else
+                    response.send(ws->reject_status_, ws->reject_body_);
+
+                return false;
+            }
+
+            ws->route_index_ = i;
+            return true;
+        }
+
+        std::get<HttpHandler>(not_found_handler)(request, response);                        // 404
+        return false;
+    }
+
+    void Router::open(std::shared_ptr<WebSocketContext> ws)
+    {
+        if (ws->route_index_ >= routes_.size())
+            return;
+
+        try {
+            routes_[ws->route_index_].open(ws);
+        }
+        catch (...)
+        {
+            ws->close(WebSocketContext::CloseCode::internal_error);
         }
     }
 

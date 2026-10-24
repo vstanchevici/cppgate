@@ -4,9 +4,10 @@
 #include <boost/beast/ssl.hpp>
 #include <cppgate/Log.h>
 #include <cppgate/Router.h>
+#include <cppgate/ServerOptions.h>
+#include <cppgate/WebSocketContext.h>
 #include <functional>
 #include <deque>
-#include "WebSocketSessionInterface.h"
 
 namespace gtvr {
 
@@ -27,7 +28,7 @@ using ws_stream_t = std::conditional_t<
 >;
 
 template<bool with_plain, bool with_ssl>
-class WebSocketSession: public WebSocketSessionInterface, public std::enable_shared_from_this<WebSocketSession<with_plain, with_ssl>>
+class WebSocketSession: public WebSocketContext, public std::enable_shared_from_this<WebSocketSession<with_plain, with_ssl>>
 {
     static_assert(with_plain || with_ssl, "WebSocketSession must have or plain or ssl stream.");
 
@@ -41,21 +42,84 @@ class WebSocketSession: public WebSocketSessionInterface, public std::enable_sha
         ws_message(std::shared_ptr<const std::string> d, bool t)
             : data(std::move(d)), is_text(t) {}
     };
-    
+
     private:
         static constexpr std::size_t                                    queue_limit = 32; // max write
         std::deque<ws_message>                                          write_queue_;
 
-        boost::beast::flat_buffer  buffer_;
-        boost::beast::http::request<boost::beast::http::string_body>    request_;
-        ws_stream_t<with_plain, with_ssl> stream_;
-    
-        // Start the asynchronous operation
-        template<class Body, class Allocator>
-        void do_accept(boost::beast::http::request<Body, boost::beast::http::basic_fields<Allocator>> req, std::shared_ptr<gtvr::router::Router> router)
-        {
-            request_ = req;
+        boost::beast::flat_buffer                                       buffer_;
+        Request                                                         request_;
+        boost::beast::http::response<boost::beast::http::string_body>   reject_response_;
+        ws_stream_t<with_plain, with_ssl>                               stream_;
+        ServerOptions                                                   options_;
+        bool                                                            closing_ = false;
 
+        // Runs a user callback, an exception must not escape into the io_context
+        template<typename F>
+        bool guarded(const char* what, F&& fn)
+        {
+            try {
+                fn();
+                return true;
+            }
+            catch (const std::exception& e) {
+                slog_error("{} threw: {}", what, e.what());
+            }
+            catch (...) {
+                slog_error("{} threw an unknown exception", what);
+            }
+            return false;
+        }
+
+        // Refuse the upgrade with a plain HTTP response, then close the connection
+        void do_reject(gtvr::router::HttpResponse response)
+        {
+            if (!response.hasResponse())
+                response.send(boost::beast::http::status::internal_server_error, "Internal Server Error");
+
+            reject_response_ = std::move(response.beast_res_);
+            reject_response_.version(request_.version());
+            reject_response_.keep_alive(false);
+            reject_response_.prepare_payload();
+
+            std::visit([this](auto& ws)
+            {
+                boost::beast::get_lowest_layer(ws).expires_after(options_.http_timeout);
+                boost::beast::http::async_write(ws.next_layer(), reject_response_, boost::beast::bind_front_handler(&WebSocketSession::on_reject, shared_from_this()));
+            }, stream_);
+        }
+
+        void on_reject(boost::beast::error_code ec, std::size_t bytes_transferred)
+        {
+            boost::ignore_unused(bytes_transferred);
+
+            if (ec)
+                slog_error("reject: {}", ec.message());
+
+            std::visit([this](auto& ws)
+            {
+                using T = std::decay_t<decltype(ws)>;
+
+                if constexpr (std::is_same_v<T, ws_ssl_t>)
+                {
+                    ws.next_layer().async_shutdown(boost::beast::bind_front_handler(&WebSocketSession::on_reject_shutdown, shared_from_this()));
+                }
+                else
+                {
+                    boost::beast::error_code ec_ignore;
+                    ws.next_layer().socket().shutdown(boost::asio::ip::tcp::socket::shutdown_send, ec_ignore);
+                }
+            }, stream_);
+        }
+
+        void on_reject_shutdown(boost::beast::error_code ec)
+        {
+            // Nothing left to do, the socket closes when the session is destroyed
+            boost::ignore_unused(ec);
+        }
+
+        void do_accept(std::shared_ptr<gtvr::router::Router> router)
+        {
             /*
              std::visit([this](auto& ws) {
                  ws.control_callback(
@@ -66,40 +130,30 @@ class WebSocketSession: public WebSocketSessionInterface, public std::enable_sha
                      });
              }, stream_);
              */
-            
+
             boost::beast::websocket::stream_base::timeout opt;
-            opt.handshake_timeout = std::chrono::seconds(30);   // Time to finish handshake
-            opt.idle_timeout = std::chrono::minutes(5);         // Close if no data for 5 mins
-            opt.keep_alive_pings = true;                        // Send pings automatically
-            opt.suggested(boost::beast::role_type::server);
-            
+            opt.handshake_timeout = options_.websocket_handshake_timeout;   // also used for the close handshake
+            opt.idle_timeout = options_.websocket_idle_timeout;
+            opt.keep_alive_pings = options_.websocket_keep_alive_pings;
+
             // Apply the options to the stream using your visit pattern
-            std::visit([&opt, &req, router, this](auto& ws)
+            std::visit([&opt, router, this](auto& ws)
             {
                 // Set maximum read message
-                ws.read_message_max(16 * 1024 * 1024);
-                
+                ws.read_message_max(options_.websocket_message_limit);
+
                 //Set timeout options
                 ws.set_option(opt);
-                
+
                 // Set a decorator to change the server name
                 ws.set_option(boost::beast::websocket::stream_base::decorator([](boost::beast::websocket::response_type& res)
                  {
                      res.set(boost::beast::http::field::server, std::string(BOOST_BEAST_VERSION_STRING) + " CppGate Server");
                  }));
-                
+
                 // Accept the websocket handshake
-                ws.async_accept(req, boost::beast::bind_front_handler(&WebSocketSession::on_accept, shared_from_this(), router));
+                ws.async_accept(request_, boost::beast::bind_front_handler(&WebSocketSession::on_accept, shared_from_this(), router));
             }, stream_);
-            
-            /*
-            for (auto& h : req.base()) {
-                std::cout << "    " << h.name_string() << "=" << h.value() << "\n";
-            }
-            std::cout << req.target() << std::endl;
-            */
-            
-            //target_ = std::string(req["Origin"]) + std::string(req.target());
         }
 
         void on_accept(std::shared_ptr<gtvr::router::Router> router, boost::beast::error_code ec)
@@ -110,9 +164,10 @@ class WebSocketSession: public WebSocketSessionInterface, public std::enable_sha
                 return;
             }
 
-            //OnOpen event
-            router->route(shared_from_this());
-            
+            // onOpen event: the route handler sets the callbacks or closes
+            router->open(shared_from_this());
+
+            // Read only after the handler, so no message arrives before onMessage is set
             do_read();
         }
 
@@ -132,33 +187,39 @@ class WebSocketSession: public WebSocketSessionInterface, public std::enable_sha
             // This indicates that the websocket_session was closed
             if (ec == boost::beast::websocket::error::closed)
             {
-                OnClose();
+                auto code = std::visit([](auto& ws) { return CloseCode(ws.reason().code); }, stream_);
+                guarded("onClose", [&] { emitClose(code); });
                 return;
             }
 
             if (ec)
             {
-                OnError();
-                slog::error("read: {0}.", ec.to_string());
+                if (ec != boost::beast::net::error::operation_aborted)
+                {
+                    // Usually the client disconnecting: the application decides in onError if it matters
+                    slog_debug("read: {}", ec.message());
+                    guarded("onError", [&] { emitError(ec); });
+                }
+
+                guarded("onClose", [&] { emitClose(CloseCode::abnormal); });
                 return;
             }
-            
-            std::visit([this](auto& ws)
-            {
-                OnMessage(buffer_.data().data(), buffer_.size(), ws.got_text());
-            }, stream_);
+
+            bool is_text = std::visit([](auto& ws) { return ws.got_text(); }, stream_);
+            std::string_view data(static_cast<const char*>(buffer_.data().data()), buffer_.size());
+
+            if (!guarded("onMessage", [&] { emitMessage(data, is_text); }))
+                close(CloseCode::internal_error);
 
             // Clear the buffer
             buffer_.consume(buffer_.size());
 
+            // Keep reading even when closing: the read completes the close handshake
             do_read();
         }
 
-        // Returns `true` if the caller may initiate a new read
-        bool do_write()
+        void do_write()
         {
-            bool const was_full = write_queue_.size() == queue_limit;
-
             if (!write_queue_.empty())
             {
                 auto& data = write_queue_.front();
@@ -168,8 +229,6 @@ class WebSocketSession: public WebSocketSessionInterface, public std::enable_sha
                     ws.async_write(boost::beast::net::buffer(*data.data), boost::beast::bind_front_handler(&WebSocketSession::on_write, shared_from_this()));
                 }, stream_);
             }
-
-            return was_full;
         }
 
         void on_write(boost::beast::error_code ec, std::size_t bytes_transferred)
@@ -178,120 +237,45 @@ class WebSocketSession: public WebSocketSessionInterface, public std::enable_sha
 
             if (ec)
             {
-                slog_error("{}", ec.message());
+                // The read loop reports the failure to the user
+                if (ec != boost::beast::net::error::operation_aborted)
+                    slog_error("write: {}", ec.message());
+
+                write_queue_.clear();
                 return;
             }
 
             write_queue_.pop_front();
-            
-            // Inform the queue that a write completed
-            if (do_write())
-            {
-                //
-            }
+
+            do_write();
         }
 
-        void on_close(boost::beast::error_code ec)
+        void on_close(CloseCode code, boost::beast::error_code ec)
         {
-            if (ec)
+            if (ec && ec != boost::beast::net::error::operation_aborted)
             {
                 // This is common if the TCP connection dropped
                 // before the WebSocket close handshake finished.
-                slog_error("{}", ec.message());
-                return;
+                slog_error("close: {}", ec.message());
             }
 
-
-            // At this point, the WebSocket handshake is complete.
-            // The TCP connection will be closed automatically by Beast
-            // or you can close the lowest layer manually to be certain.
-            //std::cout << "Session closed cleanly." << std::endl;
-
-            // IMPORTANT: Once this function ends, if no other async
-            // operations are pending, the shared_ptr 'self' inside
-            // the handler dies, and the session object is deleted.
+            // Usually the read loop already reported it, emitClose ignores the second call
+            guarded("onClose", [&] { emitClose(code); });
         }
-    
-        void fail_ex(boost::beast::error_code ec, char const* what)
-        {
-            // Filter out errors that aren't actually "failures"
-            // operation_aborted happens when we close the socket manually
-            if (ec == boost::beast::net::error::operation_aborted || ec == boost::beast::websocket::error::closed) {
-                return;
-            }
 
-            // Log the error
-            //std::cerr << "CppGate Error [" << what << "]: " << ec.message() << std::endl;
-
-            // The "Kill Switch": Slam the TCP socket shut
-            // This ensures the OS releases the file descriptor immediately.
-            std::visit([](auto& ws) {
-                boost::beast::error_code ec_ignore;
-                
-                // We use the 'socket' layer directly to shut it down
-                boost::beast::get_lowest_layer(ws).socket().shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec_ignore);
-                boost::beast::get_lowest_layer(ws).close();
-            }, stream_);
-        }
-    
         inline boost::beast::net::any_io_executor get_strand()
         {
-            boost::beast::net::any_io_executor strand;
-            
-            std::visit([&strand](auto& ws) {
-                strand = ws.get_executor();
-            }, stream_);
-            
-            return strand;
-        }
-    
-    public:
-    
-        WebSocketSession(boost::beast::tcp_stream stream) requires (with_plain): stream_(boost::beast::websocket::stream<boost::beast::tcp_stream>(std::move(stream)))
-        {            
+            return std::visit([](auto& ws) { return boost::beast::net::any_io_executor(ws.get_executor()); }, stream_);
         }
 
-        WebSocketSession(boost::beast::ssl_stream<boost::beast::tcp_stream> stream) requires (with_ssl): stream_(boost::beast::websocket::stream<boost::beast::ssl_stream<boost::beast::tcp_stream>>(std::move(stream)))
-        {            
-        }
-
-        ~WebSocketSession()
-        {
-        }
-
-        // Start the asynchronous operation 
-        template<class Body, class Allocator>
-        void run(boost::beast::http::request<Body, boost::beast::http::basic_fields<Allocator>> request, std::shared_ptr<gtvr::router::Router> router)
-        {
-            // Accept the WebSocket upgrade request
-            do_accept(std::move(request), router);
-        }
-
-        inline boost::beast::http::request<boost::beast::http::string_body>& getRequest()
-        {
-            return request_;
-        }
-
-        virtual void Close()
-        {
-            boost::beast::net::post(get_strand(), [this, self = shared_from_this()]() {
-                std::visit([this](auto& ws) {
-                    if (!ws.is_open())
-                        return;
-                    
-                    boost::beast::get_lowest_layer(ws).expires_after(std::chrono::seconds(60));
-                    
-                    ws.async_close(boost::beast::websocket::close_code::normal, boost::beast::bind_front_handler(&WebSocketSession::on_close, shared_from_this()));
-                }, stream_);
-            });
-        }
-
-    
         void send_internal(std::shared_ptr<const std::string> msg, bool is_text)
         {
             // We must move to the strand to protect the queue
             boost::beast::net::post(get_strand(), [this, self = shared_from_this(), msg = std::move(msg), is_text]() mutable {
-                
+
+                if (closing_)
+                    return;
+
                 // Check for "Slow Consumer" backpressure
                 if (write_queue_.size() > queue_limit) {
                     // Optional: Close connection or drop message
@@ -307,22 +291,66 @@ class WebSocketSession: public WebSocketSessionInterface, public std::enable_sha
                 }
             });
         }
-    
-        virtual void SendText(std::shared_ptr<const std::string> data)
+
+    public:
+
+        WebSocketSession(boost::beast::tcp_stream stream, Request request, std::string peer_ip, const ServerOptions& options) requires (with_plain)
+            : WebSocketContext(std::move(peer_ip)), request_(std::move(request)), stream_(ws_plain_t(std::move(stream))), options_(options)
         {
-            send_internal(data, true);
-        }
-    
-        virtual void SendText(std::string data)
-        {
-            send_internal(std::make_shared<std::string>(data), true);
         }
 
-        virtual void SendBinary(std::vector<uint8_t> data)
+        WebSocketSession(boost::beast::ssl_stream<boost::beast::tcp_stream> stream, Request request, std::string peer_ip, const ServerOptions& options) requires (with_ssl)
+            : WebSocketContext(std::move(peer_ip)), request_(std::move(request)), stream_(ws_ssl_t(std::move(stream))), options_(options)
+        {
+        }
+
+        // Must be called on the connection's strand
+        void run(std::shared_ptr<gtvr::router::Router> router)
+        {
+            gtvr::router::HttpResponse response;
+
+            // Same as HttpSession: result 0 means "no response yet"
+            response.beast_res_.result(0);
+
+            if (router->upgrade(shared_from_this(), response))
+                do_accept(router);
+            else
+                do_reject(std::move(response));
+        }
+
+        const Request& request() const override
+        {
+            return request_;
+        }
+
+        void close(CloseCode code = CloseCode::normal) override
+        {
+            boost::beast::net::post(get_strand(), [this, self = shared_from_this(), code]() {
+                std::visit([this, code](auto& ws) {
+                    if (closing_ || !ws.is_open())
+                        return;
+
+                    closing_ = true;
+
+                    ws.async_close(code, boost::beast::bind_front_handler(&WebSocketSession::on_close, shared_from_this(), code));
+                }, stream_);
+            });
+        }
+
+        void sendText(std::shared_ptr<const std::string> data) override
+        {
+            send_internal(std::move(data), true);
+        }
+
+        void sendText(std::string data) override
+        {
+            send_internal(std::make_shared<std::string>(std::move(data)), true);
+        }
+
+        void sendBinary(std::vector<uint8_t> data) override
         {
             send_internal(std::make_shared<std::string>(data.begin(), data.end()), false);
         }
 };
 
 }//namespace gtvr
-

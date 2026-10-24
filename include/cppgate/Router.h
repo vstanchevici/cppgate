@@ -1,9 +1,6 @@
 #pragma once
 
-#if __has_include(<memory_resource>)
-    #include <memory_resource>
-    #define HAVE_MEMORY_RESOURCE 1
-#endif
+#include <array>
 
 #include <cppgate/Log.h>
 #include <string>
@@ -17,53 +14,74 @@
 #include <boost/url/parse.hpp>
 #include <boost/url/parse_query.hpp>
 #include <boost/beast/http/rfc7230.hpp>
-#include <cppgate/WebSocketSessionInterface.h>
+#include <cppgate/WebSocketContext.h>
 #include <cppgate/cppgate.h>
-#include <cppgate/RingBuffer.h>
+#include <cppgate/TrustedProxies.h>
 #include <memory>
+#include <atomic>
+#include <version>
 
 namespace gtvr::router {
 
+    // Path parameters of the matched route, e.g. {id}. Lives on the stack of Router::route():
+    // up to inline_capacity params without any allocation. Values are views into the request path.
     struct RouteParams
     {
-        #ifdef HAVE_MEMORY_RESOURCE
-            private:
-                std::unique_ptr<std::byte[]> buffer;
-            
-                std::pmr::monotonic_buffer_resource resource;
-        
-            public:
-                std::pmr::vector<std::pair<std::string_view, std::string_view>> params;
+        public:
+            using Param = std::pair<std::string_view, std::string_view>;
 
-                RouteParams(size_t bufer_size): buffer(std::make_unique<std::byte[]>(bufer_size)), resource(buffer.get(), bufer_size, std::pmr::null_memory_resource()), params(&resource) {}
-        #else
-            public:
-                std::vector<std::pair<std::string_view, std::string_view>> params;
+            static constexpr size_t inline_capacity = 8;
 
-                RouteParams(size_t bufer_size) {}
-        #endif
+        private:
+            std::array<Param, inline_capacity>  items_;
+            size_t                              count_ = 0;
+            std::vector<Param>                  overflow_;      // only for routes with more than inline_capacity params
 
+        public:
+            RouteParams() = default;
+
+            void add(std::string_view key, std::string_view value)
+            {
+                if (count_ < inline_capacity)
+                    items_[count_++] = { key, value };
+                else
+                    overflow_.emplace_back(key, value);
+            }
 
             std::string_view get(std::string_view key) const
             {
-                for (const auto& [k, v] : params) {
+                for (size_t i = 0; i < count_; ++i) {
+                    if (items_[i].first == key) return items_[i].second;
+                }
+                for (const auto& [k, v] : overflow_) {
                     if (k == key) return v;
                 }
                 return {};
             }
 
-            void reset()
+            size_t size() const noexcept
             {
-                params.clear();
-                
-                #ifdef HAVE_MEMORY_RESOURCE
-                    resource.release();
-                #endif
+                return count_ + overflow_.size();
             }
 
-            // Delete copy/move to prevent accidental misuse of the PMR resource
+            template<typename F>
+            void forEach(F&& fn) const
+            {
+                for (size_t i = 0; i < count_; ++i)
+                    fn(items_[i].first, items_[i].second);
+                for (const auto& [k, v] : overflow_)
+                    fn(k, v);
+            }
+
+            void reset()
+            {
+                count_ = 0;
+                overflow_.clear();
+            }
+
+            // Views into one request: copying them around invites dangling
             RouteParams(const RouteParams&) = delete;
-            RouteParams(RouteParams&&) = delete;
+            RouteParams& operator=(const RouteParams&) = delete;
     };
    
     struct HttpRequest
@@ -71,7 +89,10 @@ namespace gtvr::router {
         private:
             const boost::beast::http::request<boost::beast::http::string_body>& request;
             std::string ip;
+            std::string peer_ip;
             std::shared_ptr<void> context;
+
+            friend class Router;
 
         public:
             RouteParams* params;
@@ -85,12 +106,22 @@ namespace gtvr::router {
                 return std::static_pointer_cast<T>(context);
             }
 
-            void setIP(std::string& ip) noexcept {
-                this->ip = ip;
+            void setIP(std::string ip) noexcept {
+                this->ip = std::move(ip);
             }
 
+            // Client IP: the socket address, or the one forwarded by a trusted proxy (see Router::setTrustedProxies)
             std::string& getIP() noexcept {
                 return ip;
+            }
+
+            // Set by the session, the address of the socket peer (the proxy when behind one)
+            void setPeerIP(std::string ip) noexcept {
+                peer_ip = std::move(ip);
+            }
+
+            const std::string& getPeerIP() const noexcept {
+                return peer_ip;
             }
 
             struct Headers
@@ -360,7 +391,8 @@ namespace gtvr::router {
 
 
     using HttpHandler       = std::function<void(HttpRequest&, HttpResponse&)>;
-    using WebSocketHandler  = std::function<bool(std::shared_ptr<WebSocketSessionInterface>)>;
+    using WebSocketHandler  = std::function<bool(std::shared_ptr<WebSocketContext>)>;
+    // A route only runs the middlewares of its own kind, so a group can mix HTTP and WebSocket middlewares.
     using Handler           = std::variant<HttpHandler, WebSocketHandler>;
    
 
@@ -436,8 +468,15 @@ namespace gtvr::router {
                     
                     bool MethodMatch(boost::beast::http::verb method) const;
 
+                    bool isWebSocket() const;
+
                     void operator()(HttpRequest& request, HttpResponse& response) const;
-                    void operator()(std::shared_ptr<WebSocketSessionInterface> session) const;
+
+                    // WebSocket: pre-middlewares, before the handshake. False rejects the upgrade.
+                    bool upgrade(std::shared_ptr<WebSocketContext> ws) const;
+
+                    // WebSocket: handler (onOpen) and post-middlewares, after the handshake.
+                    void open(std::shared_ptr<WebSocketContext> ws) const;
             };
 
         private:
@@ -454,13 +493,25 @@ namespace gtvr::router {
             };
 
             std::vector<Route>                          routes_;
-            std::vector<std::unique_ptr<RouteParams>>   buffers_;
-            std::unique_ptr<RingBuffer<RouteParams*>>   params_;
+
+            // Replaced as a whole by setTrustedProxies() while requests read it, so it is swapped atomically
+            #ifdef __cpp_lib_atomic_shared_ptr
+                std::atomic<std::shared_ptr<const TrustedProxies>> trusted_proxies_{ std::make_shared<const TrustedProxies>() };
+            #else
+                std::shared_ptr<const TrustedProxies>              trusted_proxies_ = std::make_shared<const TrustedProxies>();    // only through std::atomic_load/atomic_store
+            #endif
+
+            std::shared_ptr<const TrustedProxies> trustedProxies() const;
             
         public:        
             void setNotFoundHandler(Handler handler);
 
             void setMethodNotAllowedHandler(Handler handler);
+
+            // Proxies whose X-Forwarded-For / X-Real-IP headers are believed, e.g. { "127.0.0.1", "10.0.0.0/8" }.
+            // Empty by default: the client IP is the socket address. Throws std::invalid_argument.
+            // Safe to call at any time, e.g. to refresh CDN ranges: each request uses either the old or the new list.
+            void setTrustedProxies(const std::vector<std::string>& cidrs);
 
             //Group
             void group(const std::string& prefix, const std::vector<Handler>& pre_middlewares, const std::vector<Handler>& post_middlewares, const std::function<void(Router&)>& fn);            
@@ -475,9 +526,17 @@ namespace gtvr::router {
             inline void add(std::set<boost::beast::http::verb> methods, const std::string& path, HttpHandler handler, const std::vector<Handler>& post_middlewares = {}) { add(methods, path, {}, handler, post_middlewares); }
         
             void route(HttpRequest& request, HttpResponse& response);
-            void route(std::shared_ptr<WebSocketSessionInterface> session);
 
-            void initialize(size_t buffersCount, size_t bufferSize);
+            // WebSocket, before the handshake: matches the route and runs its pre-middlewares.
+            // Returns false if the upgrade must be refused, `response` then holds the HTTP reply.
+            bool upgrade(std::shared_ptr<WebSocketContext> ws, HttpResponse& response);
+
+            // WebSocket, after the handshake: runs the handler and post-middlewares of the route matched by upgrade().
+            void open(std::shared_ptr<WebSocketContext> ws);
+
+            // No longer needed: route parameters live on the stack. Kept so existing code compiles.
+            [[deprecated("Router::initialize() is not needed anymore, remove the call")]]
+            void initialize(size_t buffersCount, size_t bufferSize) {}
 
     };	
 
