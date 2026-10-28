@@ -513,11 +513,6 @@ namespace gtvr::router {
 
             // WebSocket, after the handshake: runs the handler and post-middlewares of the route matched by upgrade().
             void open(std::shared_ptr<WebSocketContext> ws);
-
-            // No longer needed: route parameters live on the stack. Kept so existing code compiles.
-            [[deprecated("Router::initialize() is not needed anymore, remove the call")]]
-            void initialize(size_t buffersCount, size_t bufferSize) {}
-
     };	
 
 }//namespace gtvr

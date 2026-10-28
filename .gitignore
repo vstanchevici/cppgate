@@ -6,6 +6,7 @@ certs/
 
 # Ignore config directory
 *.vscode
+*.idea
 *.vs
 
 # Misc

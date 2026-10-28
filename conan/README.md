@@ -9,4 +9,6 @@ cmake -S . -G "Visual Studio 17 2022" -B ./build/vs2022 -DCMAKE_TOOLCHAIN_FILE=b
 ```
 cmake -S . -G "Xcode" -B ./build/xcode -DCMAKE_TOOLCHAIN_FILE=build/xcode/generators/conan_toolchain.cmake  -DCMAKE_POLICY_DEFAULT_CMP0091=NEW
 ```
-
+```
+cmake -S . -G "Ninja Multi-Config" -B build/linux -DCMAKE_TOOLCHAIN_FILE=build/linux/generators/conan_toolchain.cmake -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DBUILD_TESTING=ON -DBUILD_EXAMPLES=ON
+```

@@ -10,6 +10,7 @@
 #include <atomic>
 #include <functional>
 #include <deque>
+#include <memory>
 
 namespace gtvr {
 
@@ -107,7 +108,7 @@ class WebSocketSession: public WebSocketContext, public Connection, public std::
 
                 if constexpr (std::is_same_v<T, ws_ssl_t>)
                 {
-                    ws.next_layer().async_shutdown(boost::beast::bind_front_handler(&WebSocketSession::on_reject_shutdown, shared_from_this()));
+                    ws.next_layer().async_shutdown(boost::beast::bind_front_handler(&WebSocketSession::on_reject_shutdown, this->shared_from_this()));
                 }
                 else
                 {

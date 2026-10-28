@@ -74,7 +74,7 @@ class HttpSession : public Connection, public std::enable_shared_from_this<HttpS
         // write_loop is already active.
         //
         // Returns `true` if the caller may initiate a new read
-        bool do_write(std::shared_ptr<gtvr::router::Router> router)
+        void do_write(std::shared_ptr<gtvr::router::Router> router)
         {
             if (!response_queue_.empty())
             {
