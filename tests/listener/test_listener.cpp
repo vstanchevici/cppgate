@@ -347,10 +347,11 @@ TEST_CASE("A WebSocket client that doesn't read is disconnected with 1008", "[li
     client.read_message_max(1024 * 1024);
     client.handshake("127.0.0.1", "/flood");
 
-    // Nothing was written yet when the handler returned: every message is pending
+    // Sends from the handler run inline (dispatch on the strand): the queue filled up, the 1008 close
+    // started and the rest was dropped before the handler returned
     auto pending = pending_after_send.get_future();
     REQUIRE(pending.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
-    CHECK(pending.get() == sent);
+    CHECK(pending.get() <= server.options.websocket_send_queue_limit);
 
     // Now read what made it, until the close frame
     int received = 0;

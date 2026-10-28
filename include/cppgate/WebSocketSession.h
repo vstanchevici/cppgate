@@ -1,5 +1,6 @@
 #pragma once
 
+#include <boost/asio/dispatch.hpp>
 #include <boost/beast/websocket.hpp>
 #include <boost/beast/ssl.hpp>
 #include <cppgate/Log.h>
@@ -277,8 +278,8 @@ class WebSocketSession: public WebSocketContext, public Connection, public std::
         {
             ++pending_;
 
-            // We must move to the strand to protect the queue
-            boost::beast::net::post(get_strand(), [this, self = shared_from_this(), msg = std::move(msg), is_text]() mutable {
+            // The queue lives on the strand: dispatch runs inline when already on it (e.g. from onMessage), queues otherwise
+            boost::beast::net::dispatch(get_strand(), [this, self = shared_from_this(), msg = std::move(msg), is_text]() mutable {
 
                 if (closing_)
                 {
@@ -355,7 +356,7 @@ class WebSocketSession: public WebSocketContext, public Connection, public std::
 
         void close(CloseCode code = CloseCode::normal) override
         {
-            boost::beast::net::post(get_strand(), [this, self = shared_from_this(), code]() {
+            boost::beast::net::dispatch(get_strand(), [this, self = shared_from_this(), code]() {
                 std::visit([this, code](auto& ws) {
                     if (closing_ || !ws.is_open())
                         return;
