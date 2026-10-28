@@ -42,6 +42,12 @@ class HttpSession : public Connection, public std::enable_shared_from_this<HttpS
         boost::beast::flat_buffer                                                               buffer_;
         http_stream_t<with_plain, with_ssl>                                                     stream_;
 
+        // Set once in run(): one copy per connection instead of one per async step
+        std::shared_ptr<gtvr::router::Router>                                                   router_;
+
+        // An async_write is in progress (the message has already left response_queue_)
+        bool                                                                                    writing_ = false;
+
 
         ServerOptions                                                                           options_;
 
@@ -60,58 +66,43 @@ class HttpSession : public Connection, public std::enable_shared_from_this<HttpS
         }
     
     private:
-        void queue_write(boost::beast::http::message_generator response, std::shared_ptr<gtvr::router::Router> router)
+        void queue_write(boost::beast::http::message_generator response)
         {
-            // Allocate and store the work
             response_queue_.push_back(std::move(response));
 
-            // If there was no previous work, start the write loop
-            if (response_queue_.size() == 1)
-                do_write(router);
+            // Start the write loop if idle
+            if (!writing_)
+                do_write();
         }
 
-        // Called to start/continue the write-loop. Should not be called when
-        // write_loop is already active.
-        //
-        // Returns `true` if the caller may initiate a new read
-        void do_write(std::shared_ptr<gtvr::router::Router> router)
+        // Writes the next queued response. Runs on the connection's strand (all handlers do),
+        // so the write starts right away, no post needed.
+        void do_write()
         {
-            if (!response_queue_.empty())
+            if (response_queue_.empty())
             {
-                auto main_executor = std::visit([](auto& hs) { return boost::beast::get_lowest_layer(hs).get_executor(); }, stream_);
-
-                // Create a strong shared reference before posting
-                auto self = shared_from_this();
-
-                // Capture 'self' by value to secure the object lifetime
-                boost::asio::post(main_executor, [this, self, router]() mutable
-                {
-                    if (response_queue_.empty()) return;
-
-                    boost::beast::http::message_generator msg = std::move(response_queue_.front());
-                    response_queue_.pop_front();
-
-                    const bool keep_alive = msg.keep_alive();
-
-                    std::visit([this, self, msg = std::move(msg), router, keep_alive](auto& hs) mutable
-                    {
-                        auto stream_executor = boost::beast::get_lowest_layer(hs).get_executor();
-
-                        auto bound_handler = boost::asio::bind_executor(
-                            stream_executor,
-                            boost::beast::bind_front_handler(&HttpSession::on_write, self, router, keep_alive)
-                        );
-
-                        boost::beast::async_write(hs, std::move(msg), std::move(bound_handler));
-                    }, stream_);
-                });
+                writing_ = false;
+                return;
             }
 
+            writing_ = true;
+
+            boost::beast::http::message_generator msg = std::move(response_queue_.front());
+            response_queue_.pop_front();
+
+            const bool keep_alive = msg.keep_alive();
+
+            std::visit([this, &msg, keep_alive](auto& hs)
+            {
+                boost::beast::async_write(hs, std::move(msg), boost::beast::bind_front_handler(&HttpSession::on_write, shared_from_this(), keep_alive));
+            }, stream_);
         }
 
-        void on_write(std::shared_ptr<gtvr::router::Router> router, bool keep_alive, boost::beast::error_code ec, std::size_t bytes_transferred)
+        void on_write(bool keep_alive, boost::beast::error_code ec, std::size_t bytes_transferred)
         {
             boost::ignore_unused(bytes_transferred);
+
+            writing_ = false;
 
             if (ec)
             {
@@ -124,12 +115,12 @@ class HttpSession : public Connection, public std::enable_shared_from_this<HttpS
             {
                 // While stopping, no new request on this connection
                 if (keep_alive && !stopping())
-                    do_read(router);
+                    do_read();
                 else
                     do_eof();
             }
             else
-                do_write(router);
+                do_write();
         }
 
 
@@ -174,9 +165,11 @@ class HttpSession : public Connection, public std::enable_shared_from_this<HttpS
             // on the I/O objects in this session. Although not strictly necessary
             // for single-threaded contexts, this example code is written to be
             // thread-safe by default.
+            router_ = std::move(router);
+
             boost::beast::net::dispatch(
                 std::visit([](auto& s) { return s.get_executor(); }, stream_),
-                boost::beast::bind_front_handler(&HttpSession::on_run, shared_from_this(), ctx, router)
+                boost::beast::bind_front_handler(&HttpSession::on_run, shared_from_this(), ctx)
             );
         }
 
@@ -190,29 +183,29 @@ class HttpSession : public Connection, public std::enable_shared_from_this<HttpS
                 std::visit([](auto& hs) { boost::beast::get_lowest_layer(hs).cancel(); }, stream_);
         }
 
-        void on_run(boost::asio::ssl::context* ctx, std::shared_ptr<gtvr::router::Router> router)
+        void on_run(boost::asio::ssl::context* ctx)
         {
             waiting_ = true;
 
-            std::visit([this, self = shared_from_this(), ctx, router](auto& hs) {
+            std::visit([this, self = shared_from_this(), ctx](auto& hs) {
                 using T = std::decay_t<decltype(hs)>;
                 
                 if constexpr (std::is_same_v<T, h_plain_t>) {
                     // Set the timeout.
                     hs.expires_after(options_.http_timeout);
 
-                    boost::beast::async_detect_ssl(hs, buffer_, boost::beast::bind_front_handler(&HttpSession::on_detect, this->shared_from_this(), ctx, std::move(router)));
+                    boost::beast::async_detect_ssl(hs, buffer_, boost::beast::bind_front_handler(&HttpSession::on_detect, this->shared_from_this(), ctx));
                 }
                 else {
                     // SSL only session: nothing to detect, handshake right away
                     boost::beast::get_lowest_layer(hs).expires_after(options_.http_timeout);
 
-                    hs.async_handshake(boost::asio::ssl::stream_base::server, buffer_.data(), boost::beast::bind_front_handler(&HttpSession::on_handshake, this->shared_from_this(), std::move(router)));
+                    hs.async_handshake(boost::asio::ssl::stream_base::server, buffer_.data(), boost::beast::bind_front_handler(&HttpSession::on_handshake, this->shared_from_this()));
                 }
             }, stream_);
         }
 
-        void on_detect(boost::asio::ssl::context* ctx, std::shared_ptr<gtvr::router::Router> router, boost::beast::error_code ec, bool result)
+        void on_detect(boost::asio::ssl::context* ctx, boost::beast::error_code ec, bool result)
         {
             waiting_ = false;
 
@@ -228,7 +221,7 @@ class HttpSession : public Connection, public std::enable_shared_from_this<HttpS
                 // Launch SSL session
                 if constexpr (with_ssl == true)
                 {
-                    on_ssl_session(ctx, router);
+                    on_ssl_session(ctx);
                 }
                 else
                 {
@@ -241,18 +234,18 @@ class HttpSession : public Connection, public std::enable_shared_from_this<HttpS
                 // Launch plain session
                 if constexpr (with_plain == true)
                 {
-                    on_plain_session(router);
+                    on_plain_session();
                 }
             }
 
         }
 
-        void on_plain_session(std::shared_ptr<gtvr::router::Router> router)
+        void on_plain_session()
         {
-            do_read(router);
+            do_read();
         }
 
-        void on_handshake(std::shared_ptr<gtvr::router::Router> router, boost::beast::error_code ec, std::size_t bytes_used)
+        void on_handshake(boost::beast::error_code ec, std::size_t bytes_used)
         {
             waiting_ = false;
 
@@ -266,7 +259,7 @@ class HttpSession : public Connection, public std::enable_shared_from_this<HttpS
             // Consume the portion of the buffer used by the handshake
             buffer_.consume(bytes_used);
 
-            do_read(router);
+            do_read();
         }
 
         void on_shutdown(boost::beast::error_code ec)
@@ -281,7 +274,7 @@ class HttpSession : public Connection, public std::enable_shared_from_this<HttpS
             // At this point the connection is closed gracefully
         }
 
-        void on_ssl_session(boost::asio::ssl::context* ctx, std::shared_ptr<gtvr::router::Router> router)
+        void on_ssl_session(boost::asio::ssl::context* ctx)
         {
             // Try to get a pointer to the existing TCP stream
             if (auto* tcp_ptr = std::get_if<h_plain_t>(&stream_)) {
@@ -294,7 +287,7 @@ class HttpSession : public Connection, public std::enable_shared_from_this<HttpS
                 stream_.template emplace<h_ssl_t>(std::move(tcp_moved), *ctx);
             }
             
-            std::visit([this, router](auto& hs) {
+            std::visit([this](auto& hs) {
                 
                 using T = std::decay_t<decltype(hs)>;
                 
@@ -305,12 +298,12 @@ class HttpSession : public Connection, public std::enable_shared_from_this<HttpS
                     // Perform the SSL handshake
                     // Note, this is the buffered version of the handshake.
                     waiting_ = true;
-                    hs.async_handshake(boost::asio::ssl::stream_base::server, buffer_.data(), boost::beast::bind_front_handler(&HttpSession::on_handshake, this->shared_from_this(), router));
+                    hs.async_handshake(boost::asio::ssl::stream_base::server, buffer_.data(), boost::beast::bind_front_handler(&HttpSession::on_handshake, this->shared_from_this()));
                 }
             }, stream_);
         }
 
-        void do_read(std::shared_ptr<gtvr::router::Router> router)
+        void do_read()
         {
             waiting_ = true;
 
@@ -321,21 +314,21 @@ class HttpSession : public Connection, public std::enable_shared_from_this<HttpS
             this->parser_->header_limit(static_cast<std::uint32_t>(options_.http_header_limit));
             this->parser_->body_limit(options_.http_body_limit);
             
-            std::visit([this, router, self = shared_from_this()](auto& hs) mutable
+            std::visit([this, self = shared_from_this()](auto& hs) mutable
             {
                 // Set the timeout, for the whole request
                 boost::beast::get_lowest_layer(hs).expires_after(options_.http_timeout);
                 
                 // The header first: a client sending "Expect: 100-continue" waits for our go before the body
-                boost::beast::http::async_read_header(hs, buffer_, *parser_, boost::beast::bind_front_handler(&HttpSession::on_read_header, std::move(self), router));
+                boost::beast::http::async_read_header(hs, buffer_, *parser_, boost::beast::bind_front_handler(&HttpSession::on_read_header, std::move(self)));
             }, stream_);
         }
 
-        void on_read_header(std::shared_ptr<gtvr::router::Router> router, boost::beast::error_code ec, std::size_t bytes_transferred)
+        void on_read_header(boost::beast::error_code ec, std::size_t bytes_transferred)
         {
             // Errors (and a body over the limit, known from Content-Length) are answered in on_read
             if (ec)
-                return on_read(router, ec, bytes_transferred);
+                return on_read(ec, bytes_transferred);
 
             const auto& request = parser_->get();
 
@@ -343,31 +336,31 @@ class HttpSession : public Connection, public std::enable_shared_from_this<HttpS
             {
                 static constexpr std::string_view continue_response = "HTTP/1.1 100 Continue\r\n\r\n";
 
-                std::visit([this, router, self = shared_from_this()](auto& hs) mutable
+                std::visit([this, self = shared_from_this()](auto& hs) mutable
                 {
                     boost::asio::async_write(hs, boost::asio::buffer(continue_response.data(), continue_response.size()),
-                        [this, router, self = std::move(self)](boost::beast::error_code write_ec, std::size_t) mutable
+                        [this, self = std::move(self)](boost::beast::error_code write_ec, std::size_t) mutable
                         {
                             if (write_ec)
                             {
                                 slog_debug("write 100-continue: {}", write_ec.message());
                                 return;
                             }
-                            read_body(std::move(router));
+                            read_body();
                         });
                 }, stream_);
                 return;
             }
 
-            read_body(std::move(router));
+            read_body();
         }
 
-        void read_body(std::shared_ptr<gtvr::router::Router> router)
+        void read_body()
         {
             // Continues with the same parser: the header is done, this reads the body (if any)
-            std::visit([this, router, self = shared_from_this()](auto& hs) mutable
+            std::visit([this, self = shared_from_this()](auto& hs) mutable
             {
-                boost::beast::http::async_read(hs, buffer_, *parser_, boost::beast::bind_front_handler(&HttpSession::on_read, std::move(self), router));
+                boost::beast::http::async_read(hs, buffer_, *parser_, boost::beast::bind_front_handler(&HttpSession::on_read, std::move(self)));
             }, stream_);
         }
 
@@ -462,7 +455,7 @@ class HttpSession : public Connection, public std::enable_shared_from_this<HttpS
             return std::nullopt;
         }
 
-        void send_error(boost::beast::http::status status, std::shared_ptr<gtvr::router::Router> router)
+        void send_error(boost::beast::http::status status)
         {
             boost::beast::http::response<boost::beast::http::string_body> res{ status, 11 };
             res.set(boost::beast::http::field::content_type, "text/plain");
@@ -472,7 +465,7 @@ class HttpSession : public Connection, public std::enable_shared_from_this<HttpS
 
             linger_ = true;
 
-            queue_write(boost::beast::http::message_generator(std::move(res)), router);
+            queue_write(boost::beast::http::message_generator(std::move(res)));
         }
 
         
@@ -488,7 +481,7 @@ class HttpSession : public Connection, public std::enable_shared_from_this<HttpS
             }, stream_);
         }
 
-        void on_read(std::shared_ptr<gtvr::router::Router> router, boost::beast::error_code ec, std::size_t bytes_transferred)
+        void on_read(boost::beast::error_code ec, std::size_t bytes_transferred)
         {
             boost::ignore_unused(bytes_transferred);
 
@@ -504,7 +497,7 @@ class HttpSession : public Connection, public std::enable_shared_from_this<HttpS
                 if (auto status = error_status(ec))
                 {
                     slog_debug("rejected request ({}): {}", static_cast<int>(*status), ec.message());
-                    return send_error(*status, router);
+                    return send_error(*status);
                 }
 
                 // Timeout, reset, client gone mid-request: nobody to answer
@@ -518,7 +511,7 @@ class HttpSession : public Connection, public std::enable_shared_from_this<HttpS
             {
                 std::string peer_ip = remote_ip();
 
-                std::visit([this, router, &peer_ip](auto& hs)
+                std::visit([this, &peer_ip](auto& hs)
                 {
                     // Disable the timeout.
                     boost::beast::get_lowest_layer(hs).expires_never();
@@ -527,7 +520,7 @@ class HttpSession : public Connection, public std::enable_shared_from_this<HttpS
                     auto ws = std::make_shared<WebSocketSession<with_plain, with_ssl>>(std::move(hs), parser_->release(), std::move(peer_ip), options_, connections_);
 
                     // Routes the upgrade, then accepts or refuses it
-                    ws->run(router);
+                    ws->run(router_);
                 }, stream_);
             }
             else
@@ -539,13 +532,13 @@ class HttpSession : public Connection, public std::enable_shared_from_this<HttpS
                 // The router works out the client IP from it (trusted proxies)
                 req.setPeerIP(remote_ip());
                 
-                router->route(req, response);
+                router_->route(req, response);
 
                 // Tell the client this connection ends after the response
                 if (stopping())
                     response.keepAlive(false);
 
-                queue_write(boost::beast::http::message_generator(std::move(response.beast_res_)), router);
+                queue_write(boost::beast::http::message_generator(std::move(response.beast_res_)));
             }
         }
 };
