@@ -497,6 +497,9 @@ namespace gtvr::router {
             void group(const std::string& prefix, const std::vector<Handler>& pre_middlewares, const std::vector<Handler>& post_middlewares, const std::function<void(Router&)>& fn);            
             inline void group(const std::string& prefix, const std::function<void(Router&)>& fn) { group(prefix, {}, {}, fn); }
         
+            // add() and group() throw std::invalid_argument for a bad path pattern: a regex RE2 rejects,
+            // a malformed or duplicate {param}, or a capturing group in a custom regex (use (?:...)).
+
             //WebSocket handlers
             void add(const std::string& path, const std::vector<Handler>& pre_middlewares, WebSocketHandler handler, const std::vector<Handler>& post_middlewares = {});        
             inline void add(const std::string& path, WebSocketHandler handler, const std::vector<Handler>& post_middlewares = {}) { add(path, {}, handler, post_middlewares); }

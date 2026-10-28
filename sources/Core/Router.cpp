@@ -1,4 +1,5 @@
 #include <cppgate/Router.h>
+#include <stdexcept>
 
 namespace gtvr::router {
 
@@ -49,11 +50,29 @@ namespace gtvr::router {
             }
         }
 
+        // A '{' that is not a valid {name} or {name:regex} block, e.g. "/users/{id" or "/users/{bad-name}"
+        if (!input.empty())
+            throw std::invalid_argument("Router: invalid route '" + path + "': malformed parameter at '" + std::string(input) + "'");
+
+        for (size_t i = 0; i < param_names.size(); ++i)
+            for (size_t j = i + 1; j < param_names.size(); ++j)
+                if (param_names[i] == param_names[j])
+                    throw std::invalid_argument("Router: invalid route '" + path + "': duplicate parameter '" + param_names[i] + "'");
+
         // Allow an optional trailing slash and ensure it matches the end of the string
         regex_pattern += "/?$";
 
-        // Create the regex pattern
-        pattern = std::make_unique<RE2>(regex_pattern);
+        // Create the regex pattern, the error goes into the exception instead of stderr
+        RE2::Options options;
+        options.set_log_errors(false);
+        pattern = std::make_unique<RE2>(regex_pattern, options);
+
+        if (!pattern->ok())
+            throw std::invalid_argument("Router: invalid route '" + path + "': " + pattern->error());
+
+        // A capturing group inside a custom regex would shift the parameter values
+        if (pattern->NumberOfCapturingGroups() != static_cast<int>(param_names.size()))
+            throw std::invalid_argument("Router: invalid route '" + path + "': custom parameter regexes must use non-capturing groups (?:...)");
     }
 
     bool Router::Route::pathMatch(std::string_view input, RouteParams& params) const
@@ -234,12 +253,6 @@ namespace gtvr::router {
             std::move(post_middlewares)
         };
 
-        // Safety check: Ensure the regex compiled successfully
-        if (!entry.pattern->ok()) {
-            // Throw an exception or log an error here
-            return;
-        }
-
         routes_.push_back(std::move(entry));
     }
 
@@ -253,12 +266,6 @@ namespace gtvr::router {
             std::move(handler),
             std::move(post_middlewares)
         };
-
-        // Safety check: Ensure the regex compiled successfully
-        if (!entry.pattern->ok()) {
-            // Throw an exception or log an error here
-            return; 
-        }
 
         routes_.push_back(std::move(entry));
     }

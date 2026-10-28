@@ -80,6 +80,8 @@ router->add({ http::verb::get, http::verb::head }, "/files/{name}", handler);   
 router->add({ http::verb::get }, R"(/items/{id:\d+})", handler);                 // custom pattern: /items/42, not /items/abc
 ```
 
+A bad pattern throws `std::invalid_argument` from `add()`: a regex RE2 rejects, an unclosed or duplicate `{param}`, or a capturing group in a custom pattern (write `{kind:(?:a|b)}`, not `{kind:(a|b)}`).
+
 In a handler:
 
 | | |

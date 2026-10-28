@@ -173,6 +173,88 @@ TEST_CASE("Custom parameter regex", "[router][params]")
     CHECK(call(router, http::verb::get, "/items/abc").status == http::status::not_found);
 }
 
+TEST_CASE("A bad path pattern throws std::invalid_argument", "[router][params][errors]")
+{
+    Router router;
+    auto handler = [](HttpRequest&, HttpResponse& res) { res.sendContent("ok"); };
+
+    SECTION("regex that RE2 rejects")
+    {
+        CHECK_THROWS_AS(router.add({ http::verb::get }, "/items/{id:[0-9}", handler), std::invalid_argument);
+        CHECK_THROWS_AS(router.add({ http::verb::get }, "/items/{id:(}", handler), std::invalid_argument);
+    }
+
+    SECTION("malformed parameter block")
+    {
+        CHECK_THROWS_AS(router.add({ http::verb::get }, "/users/{id", handler), std::invalid_argument);
+        CHECK_THROWS_AS(router.add({ http::verb::get }, "/users/{}", handler), std::invalid_argument);
+        CHECK_THROWS_AS(router.add({ http::verb::get }, "/users/{bad-name}", handler), std::invalid_argument);
+    }
+
+    SECTION("capturing group in a custom regex")
+    {
+        CHECK_THROWS_AS(router.add({ http::verb::get }, "/a/{x:(foo|bar)}/{y}", handler), std::invalid_argument);
+    }
+
+    SECTION("duplicate parameter name")
+    {
+        CHECK_THROWS_AS(router.add({ http::verb::get }, "/a/{id}/b/{id}", handler), std::invalid_argument);
+    }
+
+    SECTION("WebSocket routes too")
+    {
+        CHECK_THROWS_AS(router.add("/ws/{room", [](std::shared_ptr<gtvr::WebSocketContext>) { return true; }), std::invalid_argument);
+    }
+
+    SECTION("the message names the route")
+    {
+        try {
+            router.add({ http::verb::get }, "/users/{id", handler);
+            FAIL("no exception");
+        }
+        catch (const std::invalid_argument& e) {
+            CHECK(std::string(e.what()).find("/users/{id") != std::string::npos);
+        }
+    }
+}
+
+TEST_CASE("A failed add leaves the router unchanged", "[router][params][errors]")
+{
+    Router router;
+    router.add({ http::verb::get }, "/users/{id}", [](HttpRequest& req, HttpResponse& res) {
+        res.sendContent("user " + std::string(req.urlParam("id")));
+    });
+
+    CHECK_THROWS_AS(router.add({ http::verb::get }, "/users/{id", [](HttpRequest&, HttpResponse& res) { res.sendContent("bad"); }), std::invalid_argument);
+
+    CHECK(call(router, http::verb::get, "/users/7").body == "user 7");
+    CHECK(call(router, http::verb::get, "/users/").status == http::status::not_found);
+}
+
+TEST_CASE("group() lets a bad route pattern throw", "[router][group][errors]")
+{
+    Router router;
+    CHECK_THROWS_AS(router.group("/api", [](Router& r) {
+        r.add({ http::verb::get }, "/items/{id:[0-9}", [](HttpRequest&, HttpResponse& res) { res.sendContent("ok"); });
+    }), std::invalid_argument);
+}
+
+TEST_CASE("Valid custom patterns still work", "[router][params]")
+{
+    Router router;
+    REQUIRE_NOTHROW(router.add({ http::verb::get }, "/a/{kind:(?:foo|bar)}/{y}", [](HttpRequest& req, HttpResponse& res) {
+        res.sendContent(std::string(req.urlParam("kind")) + "," + std::string(req.urlParam("y")));
+    }));
+    REQUIRE_NOTHROW(router.add({ http::verb::get }, R"(/n/{id:\d+})", [](HttpRequest& req, HttpResponse& res) {
+        res.sendContent(std::string(req.urlParam("id")));
+    }));
+
+    CHECK(call(router, http::verb::get, "/a/bar/zz").body == "bar,zz");
+    CHECK(call(router, http::verb::get, "/a/baz/zz").status == http::status::not_found);
+    CHECK(call(router, http::verb::get, "/n/42").body == "42");
+    CHECK(call(router, http::verb::get, "/n/x").status == http::status::not_found);
+}
+
 TEST_CASE("Static text in the path is not treated as regex", "[router]")
 {
     Router router;
