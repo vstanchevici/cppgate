@@ -20,7 +20,7 @@ Tests (Catch2 comes from the conanfile as a `test_requires`):
 ```sh
 cmake build/xcode -DBUILD_TESTING=ON
 cmake --build build/xcode --config Debug --target test_router
-./build/xcode/Debug/test_router            # also test_listener (real sockets), test_cors, test_trusted_proxies, test_ring_buffer; or: ctest --test-dir build/xcode -C Debug
+./build/xcode/Debug/test_router            # also test_listener (real sockets), test_cors, test_connection_pool, test_trusted_proxies, test_ring_buffer; or: ctest --test-dir build/xcode -C Debug
 ```
 ThreadSanitizer build (Ninja, separate folder, reuses the Conan toolchain):
 ```sh
@@ -38,6 +38,7 @@ CMake options: `BUILD_TESTING` (OFF), `BUILD_EXAMPLES` (OFF; each `examples/*` d
 
 - `include/cppgate/` — public headers. Much of the logic is header-only templates (`Listener`, `HttpSession`, `WebSocketSession`). `RingBuffer.h` (lock-free MPMC queue) is currently unused, kept for later.
 - `sources/Core/` — `Router.cpp`, `Log.cpp`, `TrustedProxies.cpp`. The sessions and the Listener are header-only.
+- `include/cppgate/ConnectionPool.h` — header-only generic pool (`ConnectionPool<T>`, `Pooled<T>` handle), std::mutex, blocking `acquire(timeout)` with FIFO direct handoff (giveBack hands a connection straight to the first waiter, `dropped()` hands it the freed slot). Factory/validator run outside the lock. Not tied to Asio.
 - `include/cppgate/Middleware/` + `sources/Middleware/` — ready-made middlewares (`Cors.h`, namespace `gtvr::middleware`), each returning a `router::HttpHandler`.
 - CMake also globs `sources/{Authentication,Handlers}` and the matching include dirs; they don't exist yet but are where new modules are expected to go. New `.cpp`/`.h` files in these dirs are picked up automatically (`find_source_files` in `cmake/Tools.cmake`) — re-run CMake configure after adding files.
 - `tests/<name>/` — each subdir is its own CMake project using Catch2.

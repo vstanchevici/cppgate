@@ -13,6 +13,7 @@ A C++20 HTTP and WebSocket server library built on Boost.Beast and Boost.Asio: a
 - **CORS** middleware, preflight included.
 - **Client IP behind reverse proxies** (`X-Forwarded-For`, `X-Real-IP`), only trusted from proxies you declare.
 - **Graceful shutdown**: stop accepting, finish requests in progress, close WebSockets with 1001.
+- **Connection pool** for databases or any other client: thread-safe, acquire with timeout, validation of idle connections.
 
 ## Requirements
 
@@ -250,6 +251,49 @@ ioc.run();      // returns once the last connection is closed
 ```
 
 `stop()` stops accepting, closes idle connections, lets requests in progress finish (with `Connection: close`) and closes WebSockets with 1001. A client that never answers the WebSocket close frame can delay it up to `websocket_handshake_timeout`; call `ioc.stop()` after your own deadline if you need a hard limit.
+
+## Connection pool
+
+`gtvr::ConnectionPool<T>` (header-only, `#include <cppgate/ConnectionPool.h>`) shares a limited number of connections between threads. `T` is whatever your driver returns; it only has to be movable. With [sqlgen](https://github.com/getml/sqlgen) and PostgreSQL:
+
+```cpp
+#include <cppgate/ConnectionPool.h>
+#include <sqlgen/postgres.hpp>
+
+using PgConnection = sqlgen::Ref<sqlgen::postgres::Connection>;
+
+const auto credentials = sqlgen::postgres::Credentials{ .user = "app", .password = "...", .host = "localhost", .dbname = "app" };
+
+gtvr::ConnectionPoolOptions options;
+options.min_size = 2;
+options.max_size = 16;
+options.acquire_timeout = std::chrono::seconds(2);
+
+auto pool = gtvr::ConnectionPool<PgConnection>::create(options,
+    [credentials] { return sqlgen::postgres::connect(credentials).value(); },      // throws if the database is down
+    [](PgConnection& c) { return static_cast<bool>(c->execute("SELECT 1")); });     // optional: still alive?
+
+pool->warmUp();     // opens min_size connections now, fails fast at startup
+
+router->add({ http::verb::get }, "/people", [pool](HttpRequest&, HttpResponse& res) {
+    auto conn = pool->acquire();        // waits up to acquire_timeout, throws ConnectionPoolTimeout
+    auto people = (sqlgen::read<std::vector<Person>> | sqlgen::limit(100))(conn.get());
+    if (!people)
+    {
+        conn.discard();                 // the connection may be broken: close it, don't reuse it
+        return res.send(http::status::service_unavailable, "database error");
+    }
+    res.sendJSON(rfl::json::write(*people));
+});                                     // conn goes back to the pool here
+```
+
+- `acquire()` / `acquire(timeout)`: an idle connection (most recently used first), a new one while fewer than `max_size` are open, or else wait in line (FIFO) until one is returned. It throws `ConnectionPoolTimeout` after the timeout, which a handler turns into a 500 if you don't catch it.
+- The handle (`gtvr::Pooled<T>`) returns the connection when it goes out of scope; `release()` returns it earlier, `discard()` closes it instead.
+- Idle connections are checked with the validate function if unused for `validate_after_idle` (30 s), and closed after `max_idle` (5 min) down to `min_size`. With `max_idle = ConnectionPoolOptions::never` and no validator the pool doesn't read the clock: about 70 ns per acquire + release.
+- The factory and validator run outside the pool's lock, from several threads: they must not share unprotected state.
+- `close()` wakes waiting threads (they throw `ConnectionPoolClosed`) and closes connections as they come back.
+
+`acquire()` blocks the calling thread while it waits, and so do blocking drivers like libpq while a query runs. cppgate handlers are synchronous, so both happen on an I/O thread: run `io_context::run()` on several threads, and keep `acquire_timeout` short.
 
 ## Logging
 
