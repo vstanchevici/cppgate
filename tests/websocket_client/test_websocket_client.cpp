@@ -7,6 +7,11 @@
 
 #include "../http_client/TestCertificates.h"
 
+#ifndef _WIN32
+    #include <sys/socket.h>
+    #include <sys/time.h>
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -583,5 +588,111 @@ TEST_CASE("close() while the server is still sending is clean and quick", "[wscl
 
         REQUIRE(server.log->waitCloses(1));
         CHECK(server.log->closes[0] == CloseCode::normal);
+    }
+}
+
+namespace {
+
+    // A WSS client like some real ones: it answers close frames, but never sends TLS close_notify
+    // and keeps TCP open, waiting for the server to close it
+    struct RudeTlsClient
+    {
+        boost::asio::io_context ioc;
+        boost::asio::ssl::context ctx{ boost::asio::ssl::context::tls_client };
+        boost::asio::ssl::stream<tcp::socket> stream{ ioc, ctx };
+        std::string pending;
+
+        RudeTlsClient(unsigned short port, const std::string& path)
+        {
+            ctx.set_verify_mode(boost::asio::ssl::verify_none);
+            stream.next_layer().connect({ boost::asio::ip::make_address("127.0.0.1"), port });
+
+            #ifndef _WIN32
+                // A server that never answers fails the test instead of hanging it
+                timeval tv{ 5, 0 };
+                setsockopt(stream.next_layer().native_handle(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            #endif
+
+            stream.handshake(boost::asio::ssl::stream_base::client);
+            boost::asio::write(stream, boost::asio::buffer(
+                "GET " + path + " HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"));
+            while (pending.find("\r\n\r\n") == std::string::npos)
+                readMore();
+            pending.erase(0, pending.find("\r\n\r\n") + 4);
+        }
+
+        void readMore()
+        {
+            char buffer[4096];
+            auto n = stream.read_some(boost::asio::buffer(buffer));
+            pending.append(buffer, n);
+        }
+
+        void send(std::uint8_t opcode, const std::string& payload)
+        {
+            std::string frame{ static_cast<char>(0x80 | opcode), static_cast<char>(0x80 | payload.size()) };
+            const char mask[4] = { 1, 2, 3, 4 };
+            frame.append(mask, 4);
+            for (std::size_t i = 0; i < payload.size(); ++i)
+                frame += static_cast<char>(payload[i] ^ mask[i % 4]);
+            boost::asio::write(stream, boost::asio::buffer(frame));
+        }
+
+        void sendClose(std::uint16_t code)
+        {
+            send(0x8, std::string{ static_cast<char>(code >> 8), static_cast<char>(code & 0xff) });
+        }
+
+        // Skips other frames until a close frame from the server; returns its code
+        std::uint16_t readClose()
+        {
+            for (;;)
+            {
+                while (pending.size() >= 2)
+                {
+                    auto opcode = static_cast<std::uint8_t>(pending[0]) & 0x0f;
+                    std::size_t length = static_cast<std::uint8_t>(pending[1]) & 0x7f;
+                    if (pending.size() < 2 + length)
+                        break;
+                    std::string payload = pending.substr(2, length);
+                    pending.erase(0, 2 + length);
+                    if (opcode == 0x8)
+                        return payload.size() >= 2 ? static_cast<std::uint16_t>((static_cast<std::uint8_t>(payload[0]) << 8) | static_cast<std::uint8_t>(payload[1])) : 0;
+                }
+                readMore();
+            }
+        }
+    };
+
+}
+
+TEST_CASE("The server finishes a WSS close quickly with a client that never sends close_notify", "[wsserver][tls]")
+{
+    Server server(true);
+
+    SECTION("the client starts the close")
+    {
+        RudeTlsClient client(server.port, "/echo");
+        client.sendClose(1000);
+        CHECK(client.readClose() == 1000);
+
+        // The client now stays silent with TCP open: the server must not wait for its close_notify
+        auto t0 = std::chrono::steady_clock::now();
+        REQUIRE(server.log->waitCloses(1, 3s));
+        CHECK(std::chrono::steady_clock::now() - t0 < 2s);
+        CHECK(server.log->closes[0] == CloseCode::normal);
+    }
+
+    SECTION("the server starts the close")
+    {
+        RudeTlsClient client(server.port, "/policy");
+        client.send(0x1, "bye");                    // the route closes with 1008
+        CHECK(client.readClose() == 1008);
+        client.sendClose(1008);
+
+        auto t0 = std::chrono::steady_clock::now();
+        REQUIRE(server.log->waitCloses(1, 3s));
+        CHECK(std::chrono::steady_clock::now() - t0 < 2s);
     }
 }

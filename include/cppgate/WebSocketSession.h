@@ -6,6 +6,7 @@
 #include <cppgate/Router.h>
 #include <cppgate/ServerOptions.h>
 #include <cppgate/SessionRegistry.h>
+#include <cppgate/detail/TlsStream.h>
 #include <cppgate/WebSocketContext.h>
 #include <atomic>
 #include <functional>
@@ -16,7 +17,7 @@ namespace gtvr {
 
 // Define stream types
 using ws_plain_t = boost::beast::websocket::stream<boost::beast::tcp_stream>;
-using ws_ssl_t  = boost::beast::websocket::stream<boost::beast::ssl_stream<boost::beast::tcp_stream>>;
+using ws_ssl_t  = boost::beast::websocket::stream<detail::TlsStream>;
 
 // Declare the type ws_stream_t
 template<bool with_plain, bool with_ssl>
@@ -313,7 +314,7 @@ class WebSocketSession: public WebSocketContext, public detail::Session, public 
         {
         }
 
-        WebSocketSession(boost::beast::ssl_stream<boost::beast::tcp_stream> stream, Request request, std::string peer_ip, const ServerOptions& options, std::shared_ptr<detail::SessionRegistry> sessions = {}) requires (with_ssl)
+        WebSocketSession(detail::TlsStream stream, Request request, std::string peer_ip, const ServerOptions& options, std::shared_ptr<detail::SessionRegistry> sessions = {}) requires (with_ssl)
             : WebSocketContext(std::move(peer_ip)), request_(std::move(request)), stream_(ws_ssl_t(std::move(stream))), options_(options), sessions_(std::move(sessions))
         {
         }

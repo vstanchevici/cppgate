@@ -2,6 +2,8 @@
 
 #include "ClientCommon.h"
 
+#include <cppgate/detail/TlsStream.h>
+
 #include <boost/asio/bind_executor.hpp>
 #include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/io_context.hpp>
@@ -34,40 +36,8 @@ namespace gtvr {
         namespace websocket = boost::beast::websocket;
         using tcp           = boost::asio::ip::tcp;
 
-        // After the close frames, Beast's TLS teardown waits for the server's close_notify. Some servers
-        // never send it: they wait for the client to close TCP. The WebSocket close is already complete
-        // at that point, so the TLS goodbye only gets this long.
-        constexpr std::chrono::milliseconds teardown_grace { 500 };
-
-        // Our own type, so the teardown below is picked by Beast (found by ADL, better match than its own)
-        struct TlsLayer : beast::ssl_stream<beast::tcp_stream>
-        {
-            using beast::ssl_stream<beast::tcp_stream>::ssl_stream;
-        };
-
-        template<class TeardownHandler>
-        void async_teardown(beast::role_type, TlsLayer& stream, TeardownHandler&& handler)
-        {
-            beast::get_lowest_layer(stream).expires_after(teardown_grace);
-            stream.async_shutdown([&stream, handler = std::forward<TeardownHandler>(handler)](boost::system::error_code) mutable {
-                // Answered, truncated or timed out: the WebSocket close is done either way
-                boost::system::error_code ignored;
-                beast::get_lowest_layer(stream).socket().close(ignored);
-                handler(boost::system::error_code{});
-            });
-        }
-
-        void teardown(beast::role_type, TlsLayer& stream, boost::system::error_code& ec)
-        {
-            beast::get_lowest_layer(stream).expires_after(teardown_grace);
-            boost::system::error_code ignored;
-            stream.shutdown(ignored);
-            beast::get_lowest_layer(stream).socket().close(ignored);
-            ec = {};
-        }
-
         using PlainWs = websocket::stream<beast::tcp_stream>;
-        using TlsWs   = websocket::stream<TlsLayer>;
+        using TlsWs   = websocket::stream<detail::TlsStream>;
         using Stream  = std::variant<PlainWs, TlsWs>;
 
         std::string join(const std::vector<std::string>& items)

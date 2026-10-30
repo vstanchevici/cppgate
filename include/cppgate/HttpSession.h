@@ -6,6 +6,7 @@
 #include <cppgate/Router.h>
 #include <cppgate/ServerOptions.h>
 #include <cppgate/SessionRegistry.h>
+#include <cppgate/detail/TlsStream.h>
 #include <deque>
 #include <optional>
 #include <variant>
@@ -15,7 +16,7 @@ namespace gtvr {
 
 // Define stream types
 using h_plain_t = boost::beast::tcp_stream;
-using h_ssl_t  = boost::beast::ssl_stream<boost::beast::tcp_stream>;
+using h_ssl_t  = detail::TlsStream;      // with a TLS teardown that doesn't wait forever for close_notify
 
 // Declare the type http_stream_t
 template<bool with_plain, bool with_ssl>
@@ -385,8 +386,8 @@ class HttpSession : public detail::Session, public std::enable_shared_from_this<
                     if (linger_)
                         return do_linger();
 
-                    // Set the timeout.
-                    boost::beast::get_lowest_layer(hs).expires_after(options_.http_timeout);
+                    // The response is sent: don't hold the connection waiting for the client's close_notify
+                    boost::beast::get_lowest_layer(hs).expires_after(detail::tls_teardown_grace);
 
                     // Perform the SSL shutdown
                     hs.async_shutdown(boost::beast::bind_front_handler(&HttpSession::on_shutdown, this->shared_from_this()));
