@@ -6,7 +6,7 @@
 #include <boost/system/system_error.hpp>
 #include <cppgate/Router.h>
 #include <cppgate/ServerOptions.h>
-#include <cppgate/Connections.h>
+#include <cppgate/SessionRegistry.h>
 #include <chrono>
 #include <stdexcept>
 #include "HttpSession.h"
@@ -61,7 +61,7 @@ namespace gtvr {
             boost::asio::steady_timer               accept_retry_timer_;
             std::shared_ptr<gtvr::router::Router>   router_;
             ServerOptions                           options_;
-            std::shared_ptr<Connections>            connections_ = std::make_shared<Connections>();
+            std::shared_ptr<detail::SessionRegistry> sessions_ = std::make_shared<detail::SessionRegistry>();
 
         public:
             // Throws boost::system::system_error when the address can't be used (e.g. port already in use)
@@ -119,7 +119,7 @@ namespace gtvr {
                     self->acceptor_.close(ec);
                 });
 
-                connections_->stopAll();
+                sessions_->stopAll();
             }
 
             // The bound address, useful with port 0 (any free port)
@@ -132,7 +132,7 @@ namespace gtvr {
             // Live connections (HTTP and WebSocket)
             std::size_t connectionCount() const
             {
-                return connections_->size();
+                return sessions_->size();
             }
 
             // The context must outlive the Listener, only the pointer is kept
@@ -194,9 +194,9 @@ namespace gtvr {
                 // With plain support the session starts plain and detects TLS (when supported),
                 // SSL only: TLS from the first byte
                 if constexpr (support_plain)
-                    std::make_shared<HttpSession<support_plain, support_ssl>>(std::move(socket), options_, connections_)->run(ctx_, router_);
+                    std::make_shared<HttpSession<support_plain, support_ssl>>(std::move(socket), options_, sessions_)->run(ctx_, router_);
                 else
-                    std::make_shared<HttpSession<support_plain, support_ssl>>(std::move(socket), ctx_, options_, connections_)->run(ctx_, router_);
+                    std::make_shared<HttpSession<support_plain, support_ssl>>(std::move(socket), ctx_, options_, sessions_)->run(ctx_, router_);
 
                 // Accept another connection
                 do_accept<flags>();

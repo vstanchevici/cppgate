@@ -5,7 +5,7 @@
 #include "WebSocketSession.h"
 #include <cppgate/Router.h>
 #include <cppgate/ServerOptions.h>
-#include <cppgate/Connections.h>
+#include <cppgate/SessionRegistry.h>
 #include <deque>
 #include <optional>
 #include <variant>
@@ -30,7 +30,7 @@ using http_stream_t = std::conditional_t<
 >;
 
 template<bool with_plain, bool with_ssl>
-class HttpSession : public Connection, public std::enable_shared_from_this<HttpSession<with_plain, with_ssl>>
+class HttpSession : public detail::Session, public std::enable_shared_from_this<HttpSession<with_plain, with_ssl>>
 {
     static_assert(with_plain || with_ssl, "HttpSession must have or plain or ssl stream.");
 
@@ -50,13 +50,13 @@ class HttpSession : public Connection, public std::enable_shared_from_this<HttpS
         bool                                                                                    lingering_ = false;
         std::vector<char>                                                                       linger_buffer_;
 
-        // Graceful shutdown: the Listener's registry, and whether we wait for the client (detect, handshake, read)
-        std::shared_ptr<Connections>                                                            connections_;
+        // Graceful shutdown: the Listener's session registry, and whether we wait for the client (detect, handshake, read)
+        std::shared_ptr<detail::SessionRegistry>                                            sessions_;
         bool                                                                                    waiting_ = false;
 
         bool stopping() const noexcept
         {
-            return connections_ && connections_->stopping();
+            return sessions_ && sessions_->stopping();
         }
     
     private:
@@ -135,22 +135,22 @@ class HttpSession : public Connection, public std::enable_shared_from_this<HttpS
 
     public:
         // Starts plain, then detects TLS if with_ssl
-        explicit HttpSession(boost::asio::ip::tcp::socket&& socket, const ServerOptions& options, std::shared_ptr<Connections> connections = {}) requires (with_plain)
-            : stream_(boost::beast::tcp_stream(std::move(socket))), options_(options), connections_(std::move(connections))
+        explicit HttpSession(boost::asio::ip::tcp::socket&& socket, const ServerOptions& options, std::shared_ptr<detail::SessionRegistry> sessions = {}) requires (with_plain)
+            : stream_(boost::beast::tcp_stream(std::move(socket))), options_(options), sessions_(std::move(sessions))
         {
         }
         
         // SSL only: TLS from the first byte
-        explicit HttpSession(boost::asio::ip::tcp::socket&& socket, boost::asio::ssl::context* ctx, const ServerOptions& options, std::shared_ptr<Connections> connections = {}) requires (!with_plain)
-            : stream_(std::in_place_type<h_ssl_t>, std::move(socket), *ctx), options_(options), connections_(std::move(connections))
+        explicit HttpSession(boost::asio::ip::tcp::socket&& socket, boost::asio::ssl::context* ctx, const ServerOptions& options, std::shared_ptr<detail::SessionRegistry> sessions = {}) requires (!with_plain)
+            : stream_(std::in_place_type<h_ssl_t>, std::move(socket), *ctx), options_(options), sessions_(std::move(sessions))
         {
             
         }
 
         ~HttpSession()
         {
-            if (connections_)
-                connections_->remove(this);
+            if (sessions_)
+                sessions_->remove(this);
         }
 
         // Graceful shutdown, from any thread. A request being read or answered is finished first,
@@ -167,7 +167,7 @@ class HttpSession : public Connection, public std::enable_shared_from_this<HttpS
         void run(boost::asio::ssl::context* ctx, std::shared_ptr<gtvr::router::Router> router)
         {
             // Accepted while the Listener is stopping: returning drops the last reference, the socket closes
-            if (connections_ && !connections_->add(shared_from_this()))
+            if (sessions_ && !sessions_->add(shared_from_this()))
                 return;
 
             // We need to be executing within a strand to perform async operations
@@ -524,7 +524,7 @@ class HttpSession : public Connection, public std::enable_shared_from_this<HttpS
                     boost::beast::get_lowest_layer(hs).expires_never();
                     
                     // Create a websocket session, transferring ownership of both the socket and the HTTP request.
-                    auto ws = std::make_shared<WebSocketSession<with_plain, with_ssl>>(std::move(hs), parser_->release(), std::move(peer_ip), options_, connections_);
+                    auto ws = std::make_shared<WebSocketSession<with_plain, with_ssl>>(std::move(hs), parser_->release(), std::move(peer_ip), options_, sessions_);
 
                     // Routes the upgrade, then accepts or refuses it
                     ws->run(router);

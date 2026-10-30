@@ -5,7 +5,7 @@
 #include <cppgate/Log.h>
 #include <cppgate/Router.h>
 #include <cppgate/ServerOptions.h>
-#include <cppgate/Connections.h>
+#include <cppgate/SessionRegistry.h>
 #include <cppgate/WebSocketContext.h>
 #include <atomic>
 #include <functional>
@@ -31,7 +31,7 @@ using ws_stream_t = std::conditional_t<
 >;
 
 template<bool with_plain, bool with_ssl>
-class WebSocketSession: public WebSocketContext, public Connection, public std::enable_shared_from_this<WebSocketSession<with_plain, with_ssl>>
+class WebSocketSession: public WebSocketContext, public detail::Session, public std::enable_shared_from_this<WebSocketSession<with_plain, with_ssl>>
 {
     static_assert(with_plain || with_ssl, "WebSocketSession must have or plain or ssl stream.");
 
@@ -57,7 +57,7 @@ class WebSocketSession: public WebSocketContext, public Connection, public std::
         boost::beast::http::response<boost::beast::http::string_body>   reject_response_;
         ws_stream_t<with_plain, with_ssl>                               stream_;
         ServerOptions                                                   options_;
-        std::shared_ptr<Connections>                                    connections_;
+        std::shared_ptr<detail::SessionRegistry>                    sessions_;
         bool                                                            closing_ = false;
 
         // Runs a user callback, an exception must not escape into the io_context
@@ -160,7 +160,7 @@ class WebSocketSession: public WebSocketContext, public Connection, public std::
             }
 
             // The Listener started stopping during the handshake: don't open, say goodbye
-            if (connections_ && connections_->stopping())
+            if (sessions_ && sessions_->stopping())
             {
                 close(CloseCode::going_away);
                 do_read();
@@ -308,21 +308,21 @@ class WebSocketSession: public WebSocketContext, public Connection, public std::
 
     public:
 
-        WebSocketSession(boost::beast::tcp_stream stream, Request request, std::string peer_ip, const ServerOptions& options, std::shared_ptr<Connections> connections = {}) requires (with_plain)
-            : WebSocketContext(std::move(peer_ip)), request_(std::move(request)), stream_(ws_plain_t(std::move(stream))), options_(options), connections_(std::move(connections))
+        WebSocketSession(boost::beast::tcp_stream stream, Request request, std::string peer_ip, const ServerOptions& options, std::shared_ptr<detail::SessionRegistry> sessions = {}) requires (with_plain)
+            : WebSocketContext(std::move(peer_ip)), request_(std::move(request)), stream_(ws_plain_t(std::move(stream))), options_(options), sessions_(std::move(sessions))
         {
         }
 
-        WebSocketSession(boost::beast::ssl_stream<boost::beast::tcp_stream> stream, Request request, std::string peer_ip, const ServerOptions& options, std::shared_ptr<Connections> connections = {}) requires (with_ssl)
-            : WebSocketContext(std::move(peer_ip)), request_(std::move(request)), stream_(ws_ssl_t(std::move(stream))), options_(options), connections_(std::move(connections))
+        WebSocketSession(boost::beast::ssl_stream<boost::beast::tcp_stream> stream, Request request, std::string peer_ip, const ServerOptions& options, std::shared_ptr<detail::SessionRegistry> sessions = {}) requires (with_ssl)
+            : WebSocketContext(std::move(peer_ip)), request_(std::move(request)), stream_(ws_ssl_t(std::move(stream))), options_(options), sessions_(std::move(sessions))
         {
         }
 
         // Must be called on the connection's strand
         ~WebSocketSession()
         {
-            if (connections_)
-                connections_->remove(this);
+            if (sessions_)
+                sessions_->remove(this);
         }
 
         // Graceful shutdown, from any thread: close with 1001 (going away)
@@ -336,7 +336,7 @@ class WebSocketSession: public WebSocketContext, public Connection, public std::
             gtvr::router::HttpResponse response;
 
             // Upgrade requested while the Listener is stopping
-            if (connections_ && !connections_->add(shared_from_this()))
+            if (sessions_ && !sessions_->add(shared_from_this()))
             {
                 response.send(boost::beast::http::status::service_unavailable, "Server is shutting down");
                 return do_reject(std::move(response));
