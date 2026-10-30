@@ -13,6 +13,7 @@ A C++20 HTTP and WebSocket server library built on Boost.Beast and Boost.Asio: a
 - **CORS** middleware, preflight included.
 - **Client IP behind reverse proxies** (`X-Forwarded-For`, `X-Real-IP`), only trusted from proxies you declare.
 - **Graceful shutdown**: stop accepting, finish requests in progress, close WebSockets with 1001.
+- **HTTP client**: asynchronous HTTP/HTTPS with upload/download progress, keep-alive, timeouts and the Mozilla CA store built in.
 - **Connection pool** for databases or any other client: thread-safe, acquire with timeout, validation of idle connections.
 
 ## Requirements
@@ -251,6 +252,65 @@ ioc.run();      // returns once the last connection is closed
 ```
 
 `stop()` stops accepting, closes idle connections, lets requests in progress finish (with `Connection: close`) and closes WebSockets with 1001. A client that never answers the WebSocket close frame can delay it up to `websocket_handshake_timeout`; call `ioc.stop()` after your own deadline if you need a hard limit.
+
+## HTTP client
+
+`gtvr::HttpClient` (`#include <cppgate/Client/HttpClient.h>`) calls other HTTP/1.1 services, HTTP or HTTPS. It runs on its own threads and reports with callbacks and results, never exceptions.
+
+```cpp
+gtvr::HttpClient client;    // one for the whole program: it keeps connections alive
+
+client.send(
+    {
+        .method  = http::verb::post,
+        .url     = "https://api.example.com/v1/files",
+        .headers = { { "Authorization", "Bearer ..." }, { "Content-Type", "application/json" } },
+        .body    = json,
+        .timeout = std::chrono::seconds(10),
+    },
+    {
+        .onProgress = [](const gtvr::HttpClient::Progress& p) {
+            // p.direction: upload (the request body) then download, p.transferred of p.total (optional)
+        },
+        .onComplete = [](gtvr::HttpClient::Result r) {
+            if (!r) { r.error().message(); return; }     // DNS, connect, TLS, timeout, cancelled...
+            r->status(); r->header("Content-Type"); r->body();
+        },
+    });
+
+// From a synchronous handler: wait for the result (the client has its own threads, this can't deadlock)
+auto r = client.send({ .url = "https://api.example.com/v1/status" }).wait();
+```
+
+- `onComplete` is called exactly once. 4xx and 5xx are responses (`r->status()`), not errors. Errors are a `boost::system::error_code`: Asio/OpenSSL codes for network and TLS problems, `gtvr::client_error` for the client's own (`timeout`, `cancelled`, `response_too_large`, `invalid_url`, `unsupported_scheme`, `closed`).
+- `onProgress` reports the upload (only with a body) then the download, at most every 64 KB or 100 ms, plus a final event when complete. Upload counts bytes handed to the network.
+- `send()` returns a `Call`: `cancel()`, `wait()`, `done()`. Dropping it doesn't cancel the request. `Callbacks::executor` runs the callbacks somewhere else than the client's threads (e.g. a strand).
+- Connections are kept alive per host and reused. A request that fails on a connection the server had closed meanwhile is retried once on a new one (idempotent methods, or when the request couldn't be sent).
+- Destroying the client completes the requests in flight with `client_error::closed`. Don't destroy it from one of its own callbacks.
+
+| Option | Default | |
+|---|---|---|
+| `threads` | 1 | threads running the client and its callbacks |
+| `connect_timeout` | 10 s | DNS, TCP and TLS of a new connection |
+| `request_timeout` | 30 s | whole request; `Request::timeout` overrides it |
+| `max_response_size` | 64 MB | over it: `client_error::response_too_large` |
+| `max_idle_per_host`, `idle_timeout` | 8, 30 s | kept-alive connections |
+| `verify_peer` | `true` | check the certificate and host name; off only for local development |
+| `use_bundled_cas` | `true` | trust the Mozilla CA store built into cppgate |
+| `use_system_cas` | `false` | trust the operating system's CA store (see below) |
+| `extra_ca_files` | empty | PEM files with trusted CAs, e.g. an internal company CA |
+| `extra_ca_dirs` | empty | directories in OpenSSL's hashed format (`<hash>.0`, from `openssl rehash`) |
+| `extra_ca_pem` | empty | trusted CAs as PEM text |
+
+**Certificates.** The sources can be combined. With `verify_peer` on and no source at all, the constructor throws, so a misconfiguration doesn't show up later as "every HTTPS call fails".
+
+- *Bundled* (default): Mozilla's CA store as published by curl ([curl.se/ca](https://curl.se/ca/)), compiled into cppgate, the same on every OS. Mozilla adds and removes CAs over time: refresh it with `python3 tools/update_ca_bundle.py` (it checks the download's SHA-256), rebuild and commit. The certificate data is under the Mozilla Public License 2.0.
+- *System*: `$SSL_CERT_FILE` / `$SSL_CERT_DIR` if set, plus the first well-known bundle found: `/etc/ssl/certs/ca-certificates.crt` (Debian, Ubuntu), `/etc/pki/tls/certs/ca-bundle.crt` (Fedora, RHEL), `/etc/ssl/cert.pem` (macOS, Alpine, BSD)... Updated by the OS package manager instead of by you. Windows has no such file: there, only the environment variables count.
+- *Your own files*: to use only what is on the file system, set `use_bundled_cas = false` and give `extra_ca_files` / `extra_ca_dirs`.
+
+HTTP/1.1 only: Beast has no HTTP/2.
+
+A complete program (GET, upload with progress, calling an API from a handler): [`examples/http_client`](examples/http_client/main.cpp).
 
 ## Connection pool
 
