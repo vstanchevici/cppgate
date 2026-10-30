@@ -14,6 +14,7 @@ A C++20 HTTP and WebSocket server library built on Boost.Beast and Boost.Asio: a
 - **Client IP behind reverse proxies** (`X-Forwarded-For`, `X-Real-IP`), only trusted from proxies you declare.
 - **Graceful shutdown**: stop accepting, finish requests in progress, close WebSockets with 1001.
 - **HTTP client**: asynchronous HTTP/HTTPS with upload/download progress, keep-alive, timeouts and the Mozilla CA store built in.
+- **WebSocket client**: ws/wss with automatic reconnect, keep-alive pings and the same message API as the server.
 - **Connection pool** for databases or any other client: thread-safe, acquire with timeout, validation of idle connections.
 
 ## Requirements
@@ -311,6 +312,53 @@ auto r = client.send({ .url = "https://api.example.com/v1/status" }).wait();
 HTTP/1.1 only: Beast has no HTTP/2.
 
 A complete program (GET, upload with progress, calling an API from a handler): [`examples/http_client`](examples/http_client/main.cpp).
+
+## WebSocket client
+
+`gtvr::WebSocketClient` (`#include <cppgate/Client/WebSocketClient.h>`) connects to `ws://` and `wss://` servers. One client owns the threads and TLS settings; each `connect()` is a connection.
+
+```cpp
+gtvr::WebSocketClient client;      // TLS options as for HttpClient: bundled CAs, use_system_cas, extra_ca_*
+
+auto ws = client.connect(
+    {
+        .url          = "wss://stream.example.com/v1",
+        .headers      = { { "Authorization", "Bearer ..." } },
+        .subprotocols = { "v1.json" },
+        .reconnect    = { .enabled = true, .initial_delay = std::chrono::milliseconds(500), .max_delay = std::chrono::seconds(30) },
+    },
+    {
+        .onOpen    = [](gtvr::WebSocketClient::Connection& ws) { ws.sendText(R"({"subscribe":"prices"})"); },
+        .onMessage = [](gtvr::WebSocketClient::Connection& ws, const gtvr::WebSocketMessage& msg) { /* msg.text() */ },
+        .onClose   = [](gtvr::WebSocketClient::Connection& ws, gtvr::WebSocketClient::CloseCode code) { },
+        .onError   = [](gtvr::WebSocketClient::Connection& ws, boost::system::error_code ec) { },
+        .onReconnecting = [](gtvr::WebSocketClient::Connection& ws, unsigned attempt, std::chrono::milliseconds delay) { },
+    });
+
+ws->sendText("hello");          // any thread; false when not connected or the send queue is full
+ws->close();                    // no reconnect after this
+```
+
+- `onOpen` after every successful connect (subscribe there); `onClose` exactly once for every opened connection.
+- A failed attempt (DNS, refused, TLS, timeout) calls `onError`, then `onReconnecting` if a retry follows. Reconnect follows any close you didn't ask for (the server's 1001 on restart included).
+- No reconnect after `close()`, nor when the server answers the upgrade with an HTTP status: `onError(client_error::upgrade_rejected)`, the status in `ws->upgradeStatus()`. When `max_attempts` is used up: `onError(client_error::gave_up)`.
+- Retries wait `initial_delay`, doubling up to `max_delay`, with ±20% jitter so many clients don't reconnect at the same instant; a successful connect resets it.
+- `send*()` return `false` (the message is dropped) when not connected or when `send_queue_limit` messages are waiting: your code decides what to do, the connection stays open.
+- Dropping the last `shared_ptr` returned by `connect()` closes the connection. Callbacks receive the connection as a parameter: don't capture its `shared_ptr` in them.
+- Destroying the client closes its connections with 1001.
+
+| Option | Default | |
+|---|---|---|
+| `threads` | 1 | threads running the client and its callbacks |
+| `connect_timeout` | 10 s | DNS, TCP, TLS and upgrade of one attempt |
+| `max_message_size` | 16 MB | largest message received |
+| `idle_timeout`, `keep_alive_pings` | 30 s, on | ping when quiet, treat a silent connection as dead |
+| `close_timeout` | 5 s | waiting for the server to answer `close()` |
+| `send_queue_limit` | 32 messages | |
+| `compression` | off | `permessage-deflate`, if the server agrees |
+| TLS options | as `HttpClient` | `verify_peer`, `use_bundled_cas`, `use_system_cas`, `extra_ca_*` |
+
+A complete program (reconnect, sending from another thread, clean Ctrl+C): [`examples/websocket_client`](examples/websocket_client/main.cpp).
 
 ## Connection pool
 

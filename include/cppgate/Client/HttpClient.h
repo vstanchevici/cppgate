@@ -6,6 +6,7 @@
 #include <boost/beast/http/verb.hpp>
 #include <boost/system/error_code.hpp>
 #include <boost/system/result.hpp>
+#include <cppgate/Client/ClientTlsOptions.h>
 #include <cppgate/cppgate.h>
 #include <chrono>
 #include <cstddef>
@@ -30,6 +31,8 @@ namespace gtvr {
         unsupported_scheme,         // only http:// and https://
         closed,                     // the client was destroyed
         wait_on_client_thread,      // Call::wait() from a client callback would deadlock
+        upgrade_rejected,           // WebSocketClient: the server answered the upgrade with an HTTP status
+        gave_up,                    // WebSocketClient: Reconnect::max_attempts used up
     };
 
     CPPGATE_API const boost::system::error_category& client_category() noexcept;
@@ -76,7 +79,8 @@ namespace gtvr {
     class CPPGATE_API HttpClient
     {
         public:
-            struct Options
+            // TLS / CA settings come from ClientTlsOptions (verify_peer, use_bundled_cas, use_system_cas, extra_ca_*)
+            struct Options : ClientTlsOptions
             {
                 // Threads running the client and its callbacks
                 std::size_t                 threads                     = 1;
@@ -93,27 +97,6 @@ namespace gtvr {
                 // Idle keep-alive connections kept per host, and for how long
                 std::size_t                 max_idle_per_host           = 8;
                 std::chrono::milliseconds   idle_timeout                { 30000 };
-
-                // HTTPS: verify the server's certificate and host name. Only turn off for local development.
-                bool                        verify_peer                 = true;
-
-                // Where trusted CAs come from; any combination. With verify_peer and none of them,
-                // the constructor throws.
-
-                // The Mozilla CA store bundled with cppgate (see tools/update_ca_bundle.py)
-                bool                        use_bundled_cas             = true;
-
-                // The operating system's store: $SSL_CERT_FILE / $SSL_CERT_DIR if set, and the first
-                // well-known bundle found (/etc/ssl/certs/ca-certificates.crt on Debian/Ubuntu,
-                // /etc/pki/tls/certs/ca-bundle.crt on Fedora/RHEL, /etc/ssl/cert.pem on macOS...).
-                // Windows has no such file: there only the environment variables count.
-                bool                        use_system_cas              = false;
-
-                // More trusted CAs: PEM files (one or many certificates each), directories in OpenSSL's
-                // hashed format (<subject hash>.0, as made by c_rehash / openssl rehash), or PEM text
-                std::vector<std::string>    extra_ca_files;
-                std::vector<std::string>    extra_ca_dirs;
-                std::vector<std::string>    extra_ca_pem;
 
                 std::string                 user_agent                  = "cppgate";
             };
