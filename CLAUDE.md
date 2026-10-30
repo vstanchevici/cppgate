@@ -20,7 +20,7 @@ Tests (Catch2 comes from the conanfile as a `test_requires`):
 ```sh
 cmake build/xcode -DBUILD_TESTING=ON
 cmake --build build/xcode --config Debug --target test_router
-./build/xcode/Debug/test_router            # also test_listener (real sockets), test_cors, test_connection_pool, test_http_client (real HTTP/HTTPS; `"[network]"` = hidden internet checks), test_websocket_client (same, incl. reconnect), test_trusted_proxies, test_ring_buffer; or: ctest --test-dir build/xcode -C Debug
+./build/xcode/Debug/test_router            # also test_listener (real sockets), test_cors, test_connection_pool, test_http_client (real HTTP/HTTPS; `"[network]"` = hidden internet checks), test_websocket_client (same, incl. reconnect), test_http_limits (raw HTTP/HTTPS clients: 400/413/414/431, close after errors, keep-alive), test_trusted_proxies, test_ring_buffer; or: ctest --test-dir build/xcode -C Debug
 ```
 ThreadSanitizer build (Ninja, separate folder, reuses the Conan toolchain):
 ```sh
