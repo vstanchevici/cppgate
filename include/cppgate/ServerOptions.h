@@ -23,7 +23,7 @@ namespace gtvr {
         // After an error response (400/413/414/431) the server stops reading requests but keeps
         // discarding what the client still sends for this long, so the client gets to read the
         // response instead of a connection reset.
-        std::chrono::seconds        http_linger_timeout         { 2 };
+        std::chrono::milliseconds   http_linger_timeout         { 2000 };
 
         // --- WebSocket ---
 

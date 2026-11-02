@@ -13,6 +13,9 @@ A C++20 HTTP and WebSocket server library built on Boost.Beast and Boost.Asio: a
 - **CORS** middleware, preflight included.
 - **Client IP behind reverse proxies** (`X-Forwarded-For`, `X-Real-IP`), only trusted from proxies you declare.
 - **Graceful shutdown**: stop accepting, finish requests in progress, close WebSockets with 1001.
+- **HTTP client**: asynchronous HTTP/HTTPS with upload/download progress, keep-alive, timeouts and the Mozilla CA store built in.
+- **WebSocket client**: ws/wss with automatic reconnect, keep-alive pings and the same message API as the server.
+- **Connection pool** for databases or any other client: thread-safe, acquire with timeout, validation of idle connections.
 
 ## Requirements
 
@@ -252,6 +255,155 @@ ioc.run();      // returns once the last connection is closed
 ```
 
 `stop()` stops accepting, closes idle connections, lets requests in progress finish (with `Connection: close`) and closes WebSockets with 1001. A client that never answers the WebSocket close frame can delay it up to `websocket_handshake_timeout`; call `ioc.stop()` after your own deadline if you need a hard limit.
+
+## HTTP client
+
+`gtvr::HttpClient` (`#include <cppgate/Client/HttpClient.h>`) calls other HTTP/1.1 services, HTTP or HTTPS. It runs on its own threads and reports with callbacks and results, never exceptions.
+
+```cpp
+gtvr::HttpClient client;    // one for the whole program: it keeps connections alive
+
+client.send(
+    {
+        .method  = http::verb::post,
+        .url     = "https://api.example.com/v1/files",
+        .headers = { { "Authorization", "Bearer ..." }, { "Content-Type", "application/json" } },
+        .body    = json,
+        .timeout = std::chrono::seconds(10),
+    },
+    {
+        .onProgress = [](const gtvr::HttpClient::Progress& p) {
+            // p.direction: upload (the request body) then download, p.transferred of p.total (optional)
+        },
+        .onComplete = [](gtvr::HttpClient::Result r) {
+            if (!r) { r.error().message(); return; }     // DNS, connect, TLS, timeout, cancelled...
+            r->status(); r->header("Content-Type"); r->body();
+        },
+    });
+
+// From a synchronous handler: wait for the result (the client has its own threads, this can't deadlock)
+auto r = client.send({ .url = "https://api.example.com/v1/status" }).wait();
+```
+
+- `onComplete` is called exactly once. 4xx and 5xx are responses (`r->status()`), not errors. Errors are a `boost::system::error_code`: Asio/OpenSSL codes for network and TLS problems, `gtvr::client_error` for the client's own (`timeout`, `cancelled`, `response_too_large`, `invalid_url`, `unsupported_scheme`, `closed`).
+- `onProgress` reports the upload (only with a body) then the download, at most every 64 KB or 100 ms, plus a final event when complete. Upload counts bytes handed to the network.
+- `send()` returns a `Call`: `cancel()`, `wait()`, `done()`. Dropping it doesn't cancel the request. `Callbacks::executor` runs the callbacks somewhere else than the client's threads (e.g. a strand).
+- Connections are kept alive per host and reused. A request that fails on a connection the server had closed meanwhile is retried once on a new one (idempotent methods, or when the request couldn't be sent).
+- Destroying the client completes the requests in flight with `client_error::closed`. Don't destroy it from one of its own callbacks.
+
+| Option | Default | |
+|---|---|---|
+| `threads` | 1 | threads running the client and its callbacks |
+| `connect_timeout` | 10 s | DNS, TCP and TLS of a new connection |
+| `request_timeout` | 30 s | whole request; `Request::timeout` overrides it |
+| `max_response_size` | 64 MB | over it: `client_error::response_too_large` |
+| `max_idle_per_host`, `idle_timeout` | 8, 30 s | kept-alive connections |
+| `verify_peer` | `true` | check the certificate and host name; off only for local development |
+| `use_bundled_cas` | `true` | trust the Mozilla CA store built into cppgate |
+| `use_system_cas` | `false` | trust the operating system's CA store (see below) |
+| `extra_ca_files` | empty | PEM files with trusted CAs, e.g. an internal company CA |
+| `extra_ca_dirs` | empty | directories in OpenSSL's hashed format (`<hash>.0`, from `openssl rehash`) |
+| `extra_ca_pem` | empty | trusted CAs as PEM text |
+
+**Certificates.** The sources can be combined. With `verify_peer` on and no source at all, the constructor throws, so a misconfiguration doesn't show up later as "every HTTPS call fails".
+
+- *Bundled* (default): Mozilla's CA store as published by curl ([curl.se/ca](https://curl.se/ca/)), compiled into cppgate, the same on every OS. Mozilla adds and removes CAs over time: refresh it with `python3 tools/update_ca_bundle.py` (it checks the download's SHA-256), rebuild and commit. The certificate data is under the Mozilla Public License 2.0.
+- *System*: `$SSL_CERT_FILE` / `$SSL_CERT_DIR` if set, plus the first well-known bundle found: `/etc/ssl/certs/ca-certificates.crt` (Debian, Ubuntu), `/etc/pki/tls/certs/ca-bundle.crt` (Fedora, RHEL), `/etc/ssl/cert.pem` (macOS, Alpine, BSD)... Updated by the OS package manager instead of by you. Windows has no such file: there, only the environment variables count.
+- *Your own files*: to use only what is on the file system, set `use_bundled_cas = false` and give `extra_ca_files` / `extra_ca_dirs`.
+
+HTTP/1.1 only: Beast has no HTTP/2.
+
+A complete program (GET, upload with progress, calling an API from a handler): [`examples/http_client`](examples/http_client/main.cpp).
+
+## WebSocket client
+
+`gtvr::WebSocketClient` (`#include <cppgate/Client/WebSocketClient.h>`) connects to `ws://` and `wss://` servers. One client owns the threads and TLS settings; each `connect()` is a connection.
+
+```cpp
+gtvr::WebSocketClient client;      // TLS options as for HttpClient: bundled CAs, use_system_cas, extra_ca_*
+
+auto ws = client.connect(
+    {
+        .url          = "wss://stream.example.com/v1",
+        .headers      = { { "Authorization", "Bearer ..." } },
+        .subprotocols = { "v1.json" },
+        .reconnect    = { .enabled = true, .initial_delay = std::chrono::milliseconds(500), .max_delay = std::chrono::seconds(30) },
+    },
+    {
+        .onOpen    = [](gtvr::WebSocketClient::Connection& ws) { ws.sendText(R"({"subscribe":"prices"})"); },
+        .onMessage = [](gtvr::WebSocketClient::Connection& ws, const gtvr::WebSocketMessage& msg) { /* msg.text() */ },
+        .onClose   = [](gtvr::WebSocketClient::Connection& ws, gtvr::WebSocketClient::CloseCode code) { },
+        .onError   = [](gtvr::WebSocketClient::Connection& ws, boost::system::error_code ec) { },
+        .onReconnecting = [](gtvr::WebSocketClient::Connection& ws, unsigned attempt, std::chrono::milliseconds delay) { },
+    });
+
+ws->sendText("hello");          // any thread; false when not connected or the send queue is full
+ws->close();                    // no reconnect after this
+```
+
+- `onOpen` after every successful connect (subscribe there); `onClose` exactly once for every opened connection.
+- A failed attempt (DNS, refused, TLS, timeout) calls `onError`, then `onReconnecting` if a retry follows. Reconnect follows any close you didn't ask for (the server's 1001 on restart included).
+- No reconnect after `close()`, nor when the server answers the upgrade with an HTTP status: `onError(client_error::upgrade_rejected)`, the status in `ws->upgradeStatus()`. When `max_attempts` is used up: `onError(client_error::gave_up)`.
+- Retries wait `initial_delay`, doubling up to `max_delay`, with ±20% jitter so many clients don't reconnect at the same instant; a successful connect resets it.
+- `send*()` return `false` (the message is dropped) when not connected or when `send_queue_limit` messages are waiting: your code decides what to do, the connection stays open.
+- Dropping the last `shared_ptr` returned by `connect()` closes the connection. Callbacks receive the connection as a parameter: don't capture its `shared_ptr` in them.
+- Destroying the client closes its connections with 1001.
+
+| Option | Default | |
+|---|---|---|
+| `threads` | 1 | threads running the client and its callbacks |
+| `connect_timeout` | 10 s | DNS, TCP, TLS and upgrade of one attempt |
+| `max_message_size` | 16 MB | largest message received |
+| `idle_timeout`, `keep_alive_pings` | 30 s, on | ping when quiet, treat a silent connection as dead |
+| `close_timeout` | 5 s | waiting for the server to answer `close()` |
+| `send_queue_limit` | 32 messages | |
+| `compression` | off | `permessage-deflate`, if the server agrees |
+| TLS options | as `HttpClient` | `verify_peer`, `use_bundled_cas`, `use_system_cas`, `extra_ca_*` |
+
+A complete program (reconnect, sending from another thread, clean Ctrl+C): [`examples/websocket_client`](examples/websocket_client/main.cpp).
+
+## Connection pool
+
+`gtvr::ConnectionPool<T>` (header-only, `#include <cppgate/ConnectionPool.h>`) shares a limited number of connections between threads. `T` is whatever your driver returns; it only has to be movable. With [sqlgen](https://github.com/getml/sqlgen) and PostgreSQL:
+
+```cpp
+#include <cppgate/ConnectionPool.h>
+#include <sqlgen/postgres.hpp>
+
+using PgConnection = sqlgen::Ref<sqlgen::postgres::Connection>;
+
+const auto credentials = sqlgen::postgres::Credentials{ .user = "app", .password = "...", .host = "localhost", .dbname = "app" };
+
+gtvr::ConnectionPoolOptions options;
+options.min_size = 2;
+options.max_size = 16;
+options.acquire_timeout = std::chrono::seconds(2);
+
+auto pool = gtvr::ConnectionPool<PgConnection>::create(options,
+    [credentials] { return sqlgen::postgres::connect(credentials).value(); },      // throws if the database is down
+    [](PgConnection& c) { return static_cast<bool>(c->execute("SELECT 1")); });     // optional: still alive?
+
+pool->warmUp();     // opens min_size connections now, fails fast at startup
+
+router->add({ http::verb::get }, "/people", [pool](HttpRequest&, HttpResponse& res) {
+    auto conn = pool->acquire();        // waits up to acquire_timeout, throws ConnectionPoolTimeout
+    auto people = (sqlgen::read<std::vector<Person>> | sqlgen::limit(100))(conn.get());
+    if (!people)
+    {
+        conn.discard();                 // the connection may be broken: close it, don't reuse it
+        return res.send(http::status::service_unavailable, "database error");
+    }
+    res.sendJSON(rfl::json::write(*people));
+});                                     // conn goes back to the pool here
+```
+
+- `acquire()` / `acquire(timeout)`: an idle connection (most recently used first), a new one while fewer than `max_size` are open, or else wait in line (FIFO) until one is returned. It throws `ConnectionPoolTimeout` after the timeout, which a handler turns into a 500 if you don't catch it.
+- The handle (`gtvr::Pooled<T>`) returns the connection when it goes out of scope; `release()` returns it earlier, `discard()` closes it instead.
+- Idle connections are checked with the validate function if unused for `validate_after_idle` (30 s), and closed after `max_idle` (5 min) down to `min_size`. With `max_idle = ConnectionPoolOptions::never` and no validator the pool doesn't read the clock: about 70 ns per acquire + release.
+- The factory and validator run outside the pool's lock, from several threads: they must not share unprotected state.
+- `close()` wakes waiting threads (they throw `ConnectionPoolClosed`) and closes connections as they come back.
+
+`acquire()` blocks the calling thread while it waits, and so do blocking drivers like libpq while a query runs. cppgate handlers are synchronous, so both happen on an I/O thread: run `io_context::run()` on several threads, and keep `acquire_timeout` short.
 
 ## Logging
 
