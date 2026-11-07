@@ -285,10 +285,11 @@ client.send(
 auto r = client.send({ .url = "https://api.example.com/v1/status" }).wait();
 ```
 
-- `onComplete` is called exactly once. 4xx and 5xx are responses (`r->status()`), not errors. Errors are a `boost::system::error_code`: Asio/OpenSSL codes for network and TLS problems, `gtvr::client_error` for the client's own (`timeout`, `cancelled`, `response_too_large`, `invalid_url`, `unsupported_scheme`, `closed`).
+- `onComplete` is called exactly once. 4xx and 5xx are responses (`r->status()`), not errors. Errors are a `boost::system::error_code`: Asio/OpenSSL codes for network and TLS problems, `gtvr::client_error` for the client's own (`timeout`, `cancelled`, `response_too_large`, `invalid_url`, `unsupported_scheme`, `closed`, `too_many_redirects`, `insecure_redirect`).
 - `onProgress` reports the upload (only with a body) then the download, at most every 64 KB or 100 ms, plus a final event when complete. Upload counts bytes handed to the network.
 - `send()` returns a `Call`: `cancel()`, `wait()`, `done()`. Dropping it doesn't cancel the request. `Callbacks::executor` runs the callbacks somewhere else than the client's threads (e.g. a strand).
 - Connections are kept alive per host and reused. A request that fails on a connection the server had closed meanwhile is retried once on a new one (idempotent methods, or when the request couldn't be sent).
+- Redirects are returned as responses unless `max_redirects` is set. Then 301, 302, 303, 307 and 308 with a `Location` are followed, relative or absolute, and `request_timeout` covers them all. 301 and 302 turn POST into GET, 303 turns everything but GET and HEAD into GET, 307 and 308 keep the method and the body. A redirect to another scheme, host or port drops `Authorization`, `Cookie`, `Proxy-Authorization` and a custom `Host`, but a 307 or 308 still sends it the body. `https://` to `http://` fails with `client_error::insecure_redirect`.
 - Destroying the client completes the requests in flight with `client_error::closed`. Don't destroy it from one of its own callbacks.
 
 | Option | Default | |
@@ -296,6 +297,7 @@ auto r = client.send({ .url = "https://api.example.com/v1/status" }).wait();
 | `threads` | 1 | threads running the client and its callbacks |
 | `connect_timeout` | 10 s | DNS, TCP and TLS of a new connection |
 | `request_timeout` | 30 s | whole request; `Request::timeout` overrides it |
+| `max_redirects` | 0 | redirects followed per request; over it: `client_error::too_many_redirects`; 0: the 3xx is the response |
 | `max_response_size` | 64 MB | over it: `client_error::response_too_large` |
 | `max_idle_per_host`, `idle_timeout` | 8, 30 s | kept-alive connections |
 | `verify_peer` | `true` | check the certificate and host name; off only for local development |

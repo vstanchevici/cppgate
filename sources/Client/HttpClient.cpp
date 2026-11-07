@@ -14,6 +14,7 @@
 #include <boost/beast/http.hpp>
 #include <boost/beast/ssl.hpp>
 #include <boost/url/parse.hpp>
+#include <boost/url/url.hpp>
 #include <algorithm>
 #include <cstring>
 #include <future>
@@ -44,6 +45,8 @@ namespace gtvr {
                         case client_error::wait_on_client_thread:   return "Call::wait() from a client callback would deadlock";
                         case client_error::upgrade_rejected:        return "WebSocket upgrade rejected by the server";
                         case client_error::gave_up:                 return "WebSocket reconnect attempts used up";
+                        case client_error::too_many_redirects:      return "more redirects than max_redirects";
+                        case client_error::insecure_redirect:       return "redirect from https to http refused";
                     }
                     return "unknown HTTP client error";
                 }
@@ -216,6 +219,7 @@ namespace gtvr {
             bool                                                    reused = false;
             bool                                                    retried = false;
             bool                                                    finished = false;
+            std::size_t                                             redirects = 0;
             std::optional<client_error>                             aborted;    // timeout, cancelled or closed
 
             std::promise<HttpClient::Result>                        promise;
@@ -496,12 +500,105 @@ namespace gtvr {
             void succeed()
             {
                 bool keep_alive = parser->get().keep_alive() && !aborted;
+                bool redirect = followsRedirect();
                 auto response = parser->release();
 
                 if (keep_alive)
                     client->putIdle(std::move(conn));
 
+                if (redirect)
+                    return followRedirect(response.result(), std::string(response[http::field::location]));
+
                 finish(HttpClient::Response(std::move(response)));
+            }
+
+            // ---- redirects
+
+            bool followsRedirect() const
+            {
+                if (client->options.max_redirects == 0)
+                    return false;
+
+                switch (parser->get().result())
+                {
+                    case http::status::moved_permanently: case http::status::found: case http::status::see_other:
+                    case http::status::temporary_redirect: case http::status::permanent_redirect:
+                        return !parser->get()[http::field::location].empty();
+                    default:
+                        return false;
+                }
+            }
+
+            void followRedirect(http::status status, const std::string& location)
+            {
+                if (aborted)
+                    return finish(make_error_code(*aborted));
+
+                if (++redirects > client->options.max_redirects)
+                    return finish(make_error_code(client_error::too_many_redirects));
+
+                // Location can be relative to the current URL
+                auto base = boost::urls::parse_uri(request.url);
+                auto reference = boost::urls::parse_uri_reference(location);
+                if (!base || !reference)
+                    return finish(make_error_code(client_error::invalid_url));
+
+                boost::urls::url next;
+                if (!boost::urls::resolve(*base, *reference, next))
+                    return finish(make_error_code(client_error::invalid_url));
+
+                auto parsed = detail::parseUrl(next.buffer(), detail::UrlKind::http);
+                if (!parsed)
+                    return finish(parsed.error());
+
+                if (target.tls && !parsed->tls)
+                    return finish(make_error_code(client_error::insecure_redirect));
+
+                bool same_origin = parsed->key == target.key;
+                target = std::move(*parsed);
+                request.url = next.buffer();
+
+                // It refers to the request changed below
+                serializer.reset();
+
+                req.target(target.target);
+
+                // Credentials are for the server they were meant for
+                if (!same_origin)
+                {
+                    req.set(http::field::host, target.host_header);
+                    req.erase(http::field::authorization);
+                    req.erase(http::field::proxy_authorization);
+                    req.erase(http::field::cookie);
+                }
+
+                bool post = req.method() == http::verb::post;
+                bool get_or_head = req.method() == http::verb::get || req.method() == http::verb::head;
+
+                if ((status == http::status::see_other && !get_or_head)
+                    || ((status == http::status::moved_permanently || status == http::status::found) && post))
+                {
+                    req.method(http::verb::get);
+                    req.body().clear();
+                    req.erase(http::field::content_type);
+                    req.erase(http::field::content_encoding);
+                    req.erase(http::field::content_language);
+                    req.erase(http::field::content_length);
+                    req.erase(http::field::transfer_encoding);
+                    req.prepare_payload();
+                }
+
+                conn.reset();
+                reused = false;
+                retried = false;
+                up_done = 0;
+                down_done = 0;
+                down_total.reset();
+                reported_bytes = 0;
+                parser.reset();
+                buffer.consume(buffer.size());
+
+                connect();
             }
 
             // ---- progress
@@ -509,6 +606,9 @@ namespace gtvr {
             void progress(HttpClient::Progress::Direction direction, std::size_t done, std::optional<std::size_t> total, bool last)
             {
                 if (!callbacks.onProgress)
+                    return;
+
+                if (direction == HttpClient::Progress::Direction::download && followsRedirect())
                     return;
 
                 auto now = Clock::now();

@@ -69,6 +69,51 @@ namespace {
                 res.sendContent("slow");
             });
 
+            const std::initializer_list<http::verb> any_method = { http::verb::get, http::verb::head, http::verb::post, http::verb::put, http::verb::delete_ };
+
+            // /redirect/302?to=/inspect
+            router->add(any_method, "/redirect/{code}", [](gtvr::router::HttpRequest& req, gtvr::router::HttpResponse& res) {
+                res.header(http::field::location, req.urlQueries().get("to"));
+                res.send(static_cast<http::status>(std::stoi(std::string(req.urlParam("code")))), "moved");
+            });
+            router->add({ http::verb::get }, "/no-location", [](gtvr::router::HttpRequest&, gtvr::router::HttpResponse& res) {
+                res.send(http::status::found, "moved");
+            });
+            router->add({ http::verb::get }, "/loop", [](gtvr::router::HttpRequest&, gtvr::router::HttpResponse& res) {
+                res.header(http::field::location, "/loop");
+                res.send(http::status::found, "moved");
+            });
+            router->add({ http::verb::get }, "/slow-redirect", [](gtvr::router::HttpRequest&, gtvr::router::HttpResponse& res) {
+                std::this_thread::sleep_for(300ms);
+                res.header(http::field::location, "/slow");
+                res.send(http::status::found, "moved");
+            });
+
+            // Relative to the current URL, then to the host, then upwards
+            router->add({ http::verb::get }, "/chain/one", [](gtvr::router::HttpRequest&, gtvr::router::HttpResponse& res) {
+                res.header(http::field::location, "two");
+                res.send(http::status::found, "moved");
+            });
+            router->add({ http::verb::get }, "/chain/two", [](gtvr::router::HttpRequest&, gtvr::router::HttpResponse& res) {
+                res.header(http::field::location, "/chain/three");
+                res.send(http::status::moved_permanently, "moved");
+            });
+            router->add({ http::verb::get }, "/chain/three", [](gtvr::router::HttpRequest&, gtvr::router::HttpResponse& res) {
+                res.header(http::field::location, "../hello");
+                res.send(http::status::see_other, std::string(256 * 1024, 'm'));
+            });
+
+            // method|body|content-type|authorization|cookie|host
+            router->add(any_method, "/inspect", [](gtvr::router::HttpRequest& req, gtvr::router::HttpResponse& res) {
+                auto headers = req.headers();
+                std::string seen = std::string(req.method_string()) + "|" + std::string(req.body())
+                    + "|" + std::string(headers.get(http::field::content_type))
+                    + "|" + std::string(headers.get(http::field::authorization))
+                    + "|" + std::string(headers.get(http::field::cookie))
+                    + "|" + std::string(headers.get(http::field::host));
+                res.sendContent(seen);
+            });
+
             listener = std::make_shared<gtvr::Listener>(ioc, tcp::endpoint{ boost::asio::ip::make_address("127.0.0.1"), fixed_port });
             listener->setRouter(router);
 
@@ -244,6 +289,257 @@ TEST_CASE("No upload progress without a body", "[client][progress]")
     REQUIRE(result);
     CHECK(uploads == 0);
     CHECK(downloads >= 1);
+}
+
+TEST_CASE("Redirects are responses by default", "[client][redirect]")
+{
+    Server server;
+    HttpClient client;
+
+    auto result = client.send({ .url = server.url("/redirect/302?to=/hello") }).wait();
+    REQUIRE(result);
+    CHECK(result->status() == 302);
+    CHECK(result->header("Location") == "/hello");
+    CHECK(result->body() == "moved");
+}
+
+TEST_CASE("Redirects are followed with max_redirects", "[client][redirect]")
+{
+    Server server;
+    HttpClient::Options options;
+    options.max_redirects = 3;
+    HttpClient client(options);
+
+    SECTION("relative Locations, up to the limit")
+    {
+        auto result = client.send({ .url = server.url("/chain/one") }).wait();
+        REQUIRE(result);
+        CHECK(result->status() == 200);
+        CHECK(result->body() == "hello");
+    }
+
+    SECTION("an absolute Location")
+    {
+        auto result = client.send({ .url = server.url("/redirect/302?to=" + server.url("/hello")) }).wait();
+        REQUIRE(result);
+        CHECK(result->body() == "hello");
+    }
+
+    SECTION("over the limit fails")
+    {
+        auto result = client.send({ .url = server.url("/loop") }).wait();
+        REQUIRE_FALSE(result);
+        CHECK(result.error() == client_error::too_many_redirects);
+    }
+
+    SECTION("a 3xx that isn't a redirect, or has no Location, is the response")
+    {
+        auto multiple = client.send({ .url = server.url("/redirect/300?to=/hello") }).wait();
+        REQUIRE(multiple);
+        CHECK(multiple->status() == 300);
+
+        auto no_location = client.send({ .url = server.url("/no-location") }).wait();
+        REQUIRE(no_location);
+        CHECK(no_location->status() == 302);
+    }
+
+    SECTION("a Location that can't be followed fails")
+    {
+        auto scheme = client.send({ .url = server.url("/redirect/302?to=ftp://example.com/file") }).wait();
+        REQUIRE_FALSE(scheme);
+        CHECK(scheme.error() == client_error::unsupported_scheme);
+
+        auto invalid = client.send({ .url = server.url("/redirect/302?to=http://") }).wait();
+        REQUIRE_FALSE(invalid);
+        CHECK(invalid.error() == client_error::invalid_url);
+    }
+
+    SECTION("connections are given back on the way")
+    {
+        REQUIRE(client.send({ .url = server.url("/chain/one") }).wait());
+        CHECK(client.idleConnections() == 1);
+    }
+}
+
+TEST_CASE("Redirects change or keep the method and the body", "[client][redirect]")
+{
+    Server server;
+    HttpClient::Options options;
+    options.max_redirects = 1;
+    HttpClient client(options);
+
+    const std::vector<std::pair<std::string, std::string>> headers = { { "Content-Type", "text/plain" } };
+
+    auto send = [&](http::verb method, const std::string& code, const std::string& body) {
+        auto result = client.send({ .method = method, .url = server.url("/redirect/" + code + "?to=/inspect"), .headers = headers, .body = body }).wait();
+        REQUIRE(result);
+        CHECK(result->status() == 200);
+        return result->body();
+    };
+
+    const std::string host = "127.0.0.1:" + std::to_string(server.port);
+    const std::string as_get = "GET|||||" + host;
+
+    SECTION("301, 302 and 303 turn POST into GET, without the body and its headers")
+    {
+        CHECK(send(http::verb::post, "301", "data") == as_get);
+        CHECK(send(http::verb::post, "302", "data") == as_get);
+        CHECK(send(http::verb::post, "303", "data") == as_get);
+    }
+
+    SECTION("307 and 308 keep the method and the body")
+    {
+        CHECK(send(http::verb::post, "307", "data") == "POST|data|text/plain|||" + host);
+        CHECK(send(http::verb::post, "308", "data") == "POST|data|text/plain|||" + host);
+        CHECK(send(http::verb::put, "307", "data") == "PUT|data|text/plain|||" + host);
+    }
+
+    SECTION("301 and 302 keep other methods, 303 doesn't")
+    {
+        CHECK(send(http::verb::put, "302", "data") == "PUT|data|text/plain|||" + host);
+        CHECK(send(http::verb::delete_, "301", "") == "DELETE||text/plain|||" + host);
+        CHECK(send(http::verb::put, "303", "data") == as_get);
+    }
+
+    SECTION("HEAD stays HEAD")
+    {
+        auto result = client.send({ .method = http::verb::head, .url = server.url("/redirect/303?to=/inspect") }).wait();
+        REQUIRE(result);
+        CHECK(result->status() == 200);
+        CHECK(result->body().empty());
+    }
+}
+
+TEST_CASE("Redirects to another origin drop the credentials", "[client][redirect]")
+{
+    Server server;
+    Server other;
+    HttpClient::Options options;
+    options.max_redirects = 1;
+    HttpClient client(options);
+
+    const std::vector<std::pair<std::string, std::string>> headers = {
+        { "Authorization", "Bearer secret" }, { "Cookie", "session=secret" }, { "X-Other", "kept" } };
+
+    SECTION("the same origin keeps them")
+    {
+        auto result = client.send({ .url = server.url("/redirect/302?to=/inspect"), .headers = headers }).wait();
+        REQUIRE(result);
+        CHECK(result->body() == "GET|||Bearer secret|session=secret|127.0.0.1:" + std::to_string(server.port));
+    }
+
+    SECTION("another port doesn't, and Host follows")
+    {
+        auto result = client.send({ .url = server.url("/redirect/302?to=" + other.url("/inspect")), .headers = headers }).wait();
+        REQUIRE(result);
+        CHECK(result->body() == "GET|||||127.0.0.1:" + std::to_string(other.port));
+    }
+
+    SECTION("another host doesn't, even on the same port")
+    {
+        auto result = client.send({ .url = server.url("/redirect/302?to=" + server.url("/inspect", "http", "localhost")), .headers = headers }).wait();
+        REQUIRE(result);
+        CHECK(result->body() == "GET|||||localhost:" + std::to_string(server.port));
+    }
+
+    SECTION("a custom Host doesn't follow to another origin")
+    {
+        auto result = client.send({ .url = server.url("/redirect/302?to=" + other.url("/inspect")), .headers = { { "Host", "custom.example" } } }).wait();
+        REQUIRE(result);
+        CHECK(result->body() == "GET|||||127.0.0.1:" + std::to_string(other.port));
+    }
+
+    SECTION("a kept body goes with the method, without the credentials")
+    {
+        auto result = client.send({ .method = http::verb::post, .url = server.url("/redirect/307?to=" + other.url("/inspect")), .headers = headers, .body = "data" }).wait();
+        REQUIRE(result);
+        CHECK(result->body() == "POST|data||||127.0.0.1:" + std::to_string(other.port));
+    }
+}
+
+TEST_CASE("Redirects between HTTP and HTTPS", "[client][redirect][tls]")
+{
+    Server server(true);
+    auto options = trustingTestCa();
+    options.max_redirects = 1;
+    HttpClient client(options);
+
+    SECTION("http to https is followed")
+    {
+        auto target = server.url("/hello", "https", "localhost");
+        auto result = client.send({ .url = server.url("/redirect/302?to=" + target, "http", "localhost") }).wait();
+        REQUIRE(result);
+        CHECK(result->body() == "hello");
+    }
+
+    SECTION("https to http is refused")
+    {
+        auto target = server.url("/hello", "http", "localhost");
+        auto result = client.send({ .url = server.url("/redirect/302?to=" + target, "https", "localhost") }).wait();
+        REQUIRE_FALSE(result);
+        CHECK(result.error() == client_error::insecure_redirect);
+    }
+}
+
+TEST_CASE("The request timeout covers the redirects", "[client][redirect][timeout]")
+{
+    Server server;
+    HttpClient::Options options;
+    options.max_redirects = 1;
+    HttpClient client(options);
+
+    // 300 ms + 500 ms: each one fits, both don't
+    auto result = client.send({ .url = server.url("/slow-redirect"), .timeout = 600ms }).wait();
+    REQUIRE_FALSE(result);
+    CHECK(result.error() == client_error::timeout);
+}
+
+TEST_CASE("Redirects and progress", "[client][redirect][progress]")
+{
+    Server server;
+    HttpClient::Options options;
+    options.max_redirects = 3;
+    HttpClient client(options);
+
+    std::mutex mutex;
+    std::vector<HttpClient::Progress> events;
+    auto onProgress = [&](const HttpClient::Progress& p) {
+        std::lock_guard lock(mutex);
+        events.push_back(p);
+    };
+
+    SECTION("the redirect responses have no download events")
+    {
+        // /chain/three has a 256 KB body
+        auto result = client.send({ .url = server.url("/chain/one") }, { .onProgress = onProgress }).wait();
+        REQUIRE(result);
+        std::this_thread::sleep_for(50ms);
+
+        std::lock_guard lock(mutex);
+        REQUIRE_FALSE(events.empty());
+        for (const auto& p : events)
+        {
+            CHECK(p.direction == HttpClient::Progress::Direction::download);
+            CHECK(p.transferred <= 5);          // "hello"
+        }
+        CHECK(events.back().transferred == 5);
+    }
+
+    SECTION("a kept body uploads again, from 0")
+    {
+        const std::string body(128 * 1024, 'u');
+        auto result = client.send({ .method = http::verb::post, .url = server.url("/redirect/307?to=/echo"), .body = body }, { .onProgress = onProgress }).wait();
+        REQUIRE(result);
+        CHECK(result->body() == body);
+        std::this_thread::sleep_for(50ms);
+
+        std::lock_guard lock(mutex);
+        std::size_t last_upload_events = 0;
+        for (const auto& p : events)
+            if (p.direction == HttpClient::Progress::Direction::upload && p.transferred == body.size())
+                ++last_upload_events;
+        CHECK(last_upload_events >= 2);
+    }
 }
 
 TEST_CASE("Connections are kept alive and reused", "[client][keepalive]")

@@ -33,6 +33,8 @@ namespace gtvr {
         wait_on_client_thread,      // Call::wait() from a client callback would deadlock
         upgrade_rejected,           // WebSocketClient: the server answered the upgrade with an HTTP status
         gave_up,                    // WebSocketClient: Reconnect::max_attempts used up
+        too_many_redirects,         // over Options::max_redirects
+        insecure_redirect,          // a redirect from https:// to http://
     };
 
     CPPGATE_API const boost::system::error_category& client_category() noexcept;
@@ -75,6 +77,11 @@ namespace gtvr {
         - HTTPS is verified against the Mozilla CA store bundled from curl (plus Options::extra_ca_*).
         - Connections are kept alive and reused per scheme, host and port. A request that fails on a
           reused connection the server had closed is retried once on a new one.
+        - Redirects are returned as responses, unless Options::max_redirects is set. Then 301, 302, 303,
+          307 and 308 with a Location are followed: 301 and 302 turn POST into GET, 303 turns everything
+          but GET and HEAD into GET, 307 and 308 keep the method and the body. A redirect to another
+          scheme, host or port drops Authorization, Cookie, Proxy-Authorization and a custom Host, but a
+          307 / 308 still sends it the body. https:// to http:// fails with client_error::insecure_redirect.
     */
     class CPPGATE_API HttpClient
     {
@@ -88,8 +95,13 @@ namespace gtvr {
                 // DNS + TCP connect + TLS handshake of a new connection
                 std::chrono::milliseconds   connect_timeout             { 10000 };
 
-                // Whole request, from send() to the last byte of the response (Request::timeout overrides)
+                // Whole request, from send() to the last byte of the response, redirects included
+                // (Request::timeout overrides)
                 std::chrono::milliseconds   request_timeout             { 30000 };
+
+                // Redirects followed per request, over it the request fails with client_error::too_many_redirects.
+                // 0: not followed, the 3xx is the response
+                std::size_t                 max_redirects               = 0;
 
                 // Response body; over it the request fails with client_error::response_too_large
                 std::size_t                 max_response_size           = 64 * 1024 * 1024;
@@ -154,7 +166,8 @@ namespace gtvr {
             {
                 // Upload (while the request body is sent, only if there is one), then download. At most
                 // every 64 KB or 100 ms, and a last event per direction when it is complete. Upload counts
-                // bytes handed to the network, not bytes the server has already received.
+                // bytes handed to the network, not bytes the server has already received. A followed redirect
+                // has no download events; one that keeps the body uploads it again, from 0.
                 std::function<void(const Progress&)>    onProgress;
 
                 // Exactly once
